@@ -1,0 +1,5 @@
+.git
+.claude
+*.md
+!go.mod
+!go.sum
