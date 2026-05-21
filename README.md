@@ -72,7 +72,31 @@ See [SPEC.md](./SPEC.md#tailscale-admin-setup-user-prerequisite) for examples.
 ## Build
 
 ```sh
-go build .
+make            # builds ./tsserve for the host arch
 # or
 docker build -t tsserve .
 ```
+
+## Install as a systemd service
+
+`make install` lays down everything needed to run tsserve as a systemd
+service on Linux:
+
+- `/usr/local/bin/tsserve` — the binary.
+- `/etc/systemd/system/tsserve.service` — hardened unit, enabled on boot.
+- `/etc/tsserve/tsserve.env.example` — annotated example of every supported
+  env var.
+- A dedicated `tsserve` system user.
+
+Intended to be invoked from an image-build pipeline (Packer, Ansible, etc.)
+that has checked this repo out into a temp directory on the target host:
+
+```sh
+make
+sudo make install   # installs to /
+```
+
+The service is enabled-on-boot but **not** started — there is no config
+file yet. Provide `/etc/tsserve/tsserve.env` at first launch (e.g.
+cloud-init / user_data) and run `systemctl restart tsserve`. See
+`systemd/tsserve.env.example` for every supported variable.

@@ -1,0 +1,7 @@
+# Build artifact
+/tsserve
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

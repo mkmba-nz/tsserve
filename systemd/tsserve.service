@@ -1,0 +1,49 @@
+[Unit]
+Description=tsserve: Docker/ECS to Tailscale Services proxy
+Documentation=https://github.com/tsserve/tsserve
+After=network-online.target
+Wants=network-online.target
+# Stay inactive until the consumer drops a config file. user_data (or any
+# other runtime mechanism) writes /etc/tsserve/tsserve.env then issues
+# `systemctl start tsserve`. Without this guard the unit would spin on
+# restart-on-failure while logging config-not-found until config arrived.
+ConditionPathExists=/etc/tsserve/tsserve.env
+
+[Service]
+Type=simple
+User=tsserve
+Group=tsserve
+EnvironmentFile=/etc/tsserve/tsserve.env
+ExecStart=/usr/local/bin/tsserve
+
+# /var/lib/tsserve owned by tsserve:tsserve, mode 0700. Persists tsnet state
+# across restarts.
+StateDirectory=tsserve
+StateDirectoryMode=0700
+
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/tsserve
+
+# tsnet needs outbound networking and IPv6 for relay/DERP; do not lock down
+# AF_INET6 or AF_NETLINK.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
