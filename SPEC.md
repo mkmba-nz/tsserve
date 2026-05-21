@@ -152,6 +152,27 @@ The Tailscale proxy layer then forwards the granted capabilities to the backend 
 
 If `tsserve.caps` is not set, `AcceptAppCaps` is left nil and no capability headers are forwarded.
 
+#### Upstream caveat — grants must target a node, not just the service
+
+As of Tailscale `v1.98.x`, app capabilities granted to a Tailscale Service do not reach the backend when the ACL grant's `dst` is only the service name. Tailscale's serve layer resolves the connecting peer's capabilities against the hosting node's machine IP, but a grant compiled from `dst: ["svc:foo"]` registers the capability against the service's virtual IP — so the lookup misses and the `Tailscale-App-Capabilities` header is silently omitted. All other plumbing works: the request reaches the backend, identity headers arrive normally, and `tsserve.caps` is still passed correctly to `AcceptAppCaps`. Only the capability header is missing.
+
+Tracked upstream as [tailscale/tailscale#19618](https://github.com/tailscale/tailscale/issues/19618). [PR #19702](https://github.com/tailscale/tailscale/pull/19702) landed helper functions (`PeerCapsForService`, `PeerCapsForIP`) but did not wire them into the serve-layer header injection.
+
+**Workaround**: include the tsserve node's tag alongside the service in the grant's `dst`. That adds the node's machine IP to the cap rule's destination set so the lookup succeeds:
+
+```jsonc
+{
+  "src": ["autogroup:member"],
+  "dst": ["svc:api", "tag:tsserve"],
+  "ip":  ["*"],
+  "app": {
+    "example.com/cap/admin": [{}]
+  }
+}
+```
+
+This widens the cap grant slightly — the peer now has the capability against the node generally, not just when accessing this service — but for typical deployments (one tsserve node fronting these specific services) it's equivalent in practice.
+
 ---
 
 ## Configuration
