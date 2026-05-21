@@ -61,6 +61,28 @@ General:
 - `TSSERVE_STATE_DIR` (default `/var/lib/tsserve`)
 - `TSSERVE_LOG_LEVEL` (`debug` | `info` | `warn` | `error`)
 
+Observability:
+
+- `TSSERVE_METRICS_ADDR` (default `127.0.0.1:9090`) — loopback HTTP listener
+  serving `/metrics` for Prometheus. Set to `""` to disable; set to
+  `0.0.0.0:9100` to expose to a remote scraper (you own the firewall).
+- `TSSERVE_TRAEFIK_PORT` — if set, the tailnet HTTPS listener proxies
+  `/traefik` to `http://localhost:<port>` (useful when tsserve runs on a
+  gateway host alongside Traefik).
+
+## Local endpoints
+
+In addition to the per-service Tailscale listeners, tsserve always runs:
+
+- `https://<TSSERVE_HOSTNAME>.<tailnet>.ts.net/` — status page (tailnet
+  identity, discovery mode, registered backends, build info).
+- `https://<TSSERVE_HOSTNAME>.<tailnet>.ts.net/traefik/...` — reverse proxy
+  to `http://localhost:<TSSERVE_TRAEFIK_PORT>` when configured.
+- `http://<TSSERVE_METRICS_ADDR>/metrics` — Prometheus exposition, default
+  `127.0.0.1:9090`.
+
+See [SPEC.md → Observability and local endpoints](./SPEC.md#observability-and-local-endpoints) for the metric inventory and a caveat about Traefik dashboard path-prefix behavior.
+
 ## Prerequisites in the Tailscale admin console
 
 1. Enable **HTTPS Certificates** and **MagicDNS** under DNS.

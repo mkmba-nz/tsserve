@@ -6,10 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"tailscale.com/tsnet"
+
+	"mkmba.nz/tsserve/metrics"
 )
 
 // FatalError is returned by [Manager.Register] when a configuration problem
@@ -23,8 +27,9 @@ func (e *FatalError) Unwrap() error { return e.err }
 // Manager owns the tsnet.Server and the live set of Tailscale Service
 // listeners and reverse proxies. It is safe for concurrent use.
 type Manager struct {
-	srv    *tsnet.Server
-	logger *slog.Logger
+	srv     *tsnet.Server
+	logger  *slog.Logger
+	metrics *metrics.Collector
 
 	mu       sync.Mutex
 	byCID    map[string]*activeService // containerID -> service
@@ -38,20 +43,41 @@ type activeService struct {
 	closeFn func() error
 }
 
-// defSnapshot is the subset of docker.ServiceDef we keep on the active service.
-// We avoid the cross-package import by copying only the fields we need.
+// defSnapshot is the immutable per-service state we need to render the status
+// page and clean up at deregistration time.
 type defSnapshot struct {
-	Service string
-	Caps    []string
+	Service      string
+	Backend      string // "scheme://ip:port"
+	Scheme       string
+	BackendHost  string
+	Port         uint16
+	Caps         []string
+	ContainerID  string
+	RegisteredAt time.Time
+}
+
+// ServiceView is a defensive copy of an active service's state, returned by
+// [Manager.Snapshot] for read-only consumers (e.g. the status page).
+type ServiceView struct {
+	Service      string
+	Backend      string
+	Scheme       string
+	BackendHost  string
+	Port         uint16
+	Caps         []string
+	ContainerID  string
+	RegisteredAt time.Time
 }
 
 // NewManager wraps a tsnet.Server that has already started successfully.
-func NewManager(srv *tsnet.Server, logger *slog.Logger) *Manager {
+// mc may be nil; when nil no metrics are recorded.
+func NewManager(srv *tsnet.Server, logger *slog.Logger, mc *metrics.Collector) *Manager {
 	return &Manager{
-		srv:    srv,
-		logger: logger,
-		byCID:  map[string]*activeService{},
-		byName: map[string]string{},
+		srv:     srv,
+		logger:  logger,
+		metrics: mc,
+		byCID:   map[string]*activeService{},
+		byName:  map[string]string{},
 	}
 }
 
@@ -108,7 +134,15 @@ func (m *Manager) Register(containerID string, def *ServiceDef, backendIP string
 		return nil
 	}
 
-	var handler http.Handler = newReverseProxy(def.Scheme, backendIP, def.Port, m.logger)
+	onError := func(reason string) {}
+	if m.metrics != nil {
+		onError = func(reason string) {
+			m.metrics.Errors.WithLabelValues(def.Service, reason).Inc()
+		}
+	}
+
+	var handler http.Handler = newReverseProxy(def.Scheme, backendIP, def.Port, m.logger, onError)
+	handler = m.metrics.Middleware(def.Service, handler)
 
 	httpSrv := &http.Server{Handler: handler}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -122,6 +156,17 @@ func (m *Manager) Register(containerID string, def *ServiceDef, backendIP string
 		}
 	}()
 
+	snap := defSnapshot{
+		Service:      def.Service,
+		Backend:      fmt.Sprintf("%s://%s:%d", def.Scheme, backendIP, def.Port),
+		Scheme:       def.Scheme,
+		BackendHost:  backendIP,
+		Port:         def.Port,
+		Caps:         append([]string(nil), def.Caps...),
+		ContainerID:  containerID,
+		RegisteredAt: time.Now(),
+	}
+
 	m.mu.Lock()
 	if m.shutdown {
 		m.mu.Unlock()
@@ -131,7 +176,7 @@ func (m *Manager) Register(containerID string, def *ServiceDef, backendIP string
 		return errors.New("manager is shutting down")
 	}
 	m.byCID[containerID] = &activeService{
-		def:    defSnapshot{Service: def.Service, Caps: def.Caps},
+		def:    snap,
 		cancel: cancel,
 		closeFn: func() error {
 			_ = httpSrv.Close()
@@ -141,9 +186,13 @@ func (m *Manager) Register(containerID string, def *ServiceDef, backendIP string
 	m.byName[def.Service] = containerID
 	m.mu.Unlock()
 
+	if m.metrics != nil {
+		m.metrics.Active.Inc()
+	}
+
 	m.logger.Info("service registered",
 		"service", def.Service,
-		"backend", fmt.Sprintf("%s://%s:%d", def.Scheme, backendIP, def.Port),
+		"backend", snap.Backend,
 		"caps", def.Caps,
 		"container", short(containerID))
 	return nil
@@ -169,7 +218,32 @@ func (m *Manager) Deregister(containerID string) {
 	if err := svc.closeFn(); err != nil {
 		m.logger.Warn("error closing service listener", "service", svc.def.Service, "err", err)
 	}
+	if m.metrics != nil {
+		m.metrics.Active.Dec()
+	}
 	m.logger.Info("service deregistered", "service", svc.def.Service, "container", short(containerID))
+}
+
+// Snapshot returns a defensive copy of the active service set, sorted by
+// service name. Intended for the status page and other read-only consumers.
+func (m *Manager) Snapshot() []ServiceView {
+	m.mu.Lock()
+	out := make([]ServiceView, 0, len(m.byCID))
+	for _, s := range m.byCID {
+		out = append(out, ServiceView{
+			Service:      s.def.Service,
+			Backend:      s.def.Backend,
+			Scheme:       s.def.Scheme,
+			BackendHost:  s.def.BackendHost,
+			Port:         s.def.Port,
+			Caps:         append([]string(nil), s.def.Caps...),
+			ContainerID:  s.def.ContainerID,
+			RegisteredAt: s.def.RegisteredAt,
+		})
+	}
+	m.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].Service < out[j].Service })
+	return out
 }
 
 // Close tears down all active services. It is safe to call once.
@@ -189,6 +263,9 @@ func (m *Manager) Close() {
 		if err := s.closeFn(); err != nil {
 			m.logger.Warn("error closing service on shutdown", "service", s.def.Service, "err", err)
 		}
+	}
+	if m.metrics != nil {
+		m.metrics.Active.Set(0)
 	}
 }
 

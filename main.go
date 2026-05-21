@@ -23,6 +23,8 @@ import (
 	dockerpkg "mkmba.nz/tsserve/docker"
 	"mkmba.nz/tsserve/ecs"
 	"mkmba.nz/tsserve/labels"
+	"mkmba.nz/tsserve/local"
+	"mkmba.nz/tsserve/metrics"
 	"mkmba.nz/tsserve/proxy"
 )
 
@@ -70,14 +72,42 @@ func run() error {
 		return fmt.Errorf("tsnet up: %w", err)
 	}
 
-	mgr := proxy.NewManager(srv, logger)
+	lc, err := srv.LocalClient()
+	if err != nil {
+		return fmt.Errorf("tsnet local client: %w", err)
+	}
+
+	mc := metrics.New()
+	mgr := proxy.NewManager(srv, logger, mc)
 	defer mgr.Close()
+
+	discoveryMode := strings.ToLower(envDefault("TSSERVE_DISCOVERY", "docker"))
+
+	traefikPort, err := local.ParseTraefikPort(os.Getenv("TSSERVE_TRAEFIK_PORT"))
+	if err != nil {
+		return err
+	}
+	metricsAddr := envDefault("TSSERVE_METRICS_ADDR", "127.0.0.1:9090")
+
+	localSrv := &local.Server{
+		Logger:        logger,
+		Manager:       mgr,
+		LocalClient:   lc,
+		Metrics:       mc,
+		TraefikPort:   traefikPort,
+		MetricsAddr:   metricsAddr,
+		DiscoveryMode: discoveryMode,
+		TSNet:         srv,
+		Started:       time.Now(),
+	}
+	localErr := make(chan error, 1)
+	go func() { localErr <- localSrv.Run(ctx) }()
 
 	fatal := make(chan error, 1)
 	registrar := &registrarAdapter{mgr: mgr, fatal: fatal}
 
 	watchErr := make(chan error, 1)
-	if err := startWatcher(ctx, registrar, logger, watchErr); err != nil {
+	if err := startWatcher(ctx, discoveryMode, registrar, logger, watchErr); err != nil {
 		return err
 	}
 
@@ -93,6 +123,11 @@ func run() error {
 			return nil
 		}
 		return err
+	case err := <-localErr:
+		if err == nil || errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return fmt.Errorf("local server: %w", err)
 	}
 }
 
@@ -122,8 +157,7 @@ func (a *registrarAdapter) Deregister(containerID string) { a.mgr.Deregister(con
 
 // startWatcher selects and starts the configured discovery backend, sending
 // its terminal error (or nil on clean shutdown) on watchErr.
-func startWatcher(ctx context.Context, registrar *registrarAdapter, logger *slog.Logger, watchErr chan<- error) error {
-	mode := strings.ToLower(envDefault("TSSERVE_DISCOVERY", "docker"))
+func startWatcher(ctx context.Context, mode string, registrar *registrarAdapter, logger *slog.Logger, watchErr chan<- error) error {
 	switch mode {
 	case "docker":
 		watcher, err := dockerpkg.NewWatcher(registrar, logger)

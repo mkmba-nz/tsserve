@@ -21,7 +21,7 @@ A single-binary Docker-to-Tailscale-Services proxy built on `tsnet`.
 - Tailscale Funnel support.
 - Automatic service definition creation via the Tailscale API (users pre-create services in the admin console or configure ACL auto-approvers).
 - TCP/UDP proxying (HTTP/HTTPS only for v1).
-- Metrics, tracing, or observability endpoints.
+- Distributed tracing.
 
 ---
 
@@ -188,6 +188,9 @@ tsserve supports three authentication modes. The first matching mode wins, check
 | `TSSERVE_ECS_CLUSTER` | ✱✱✱ | — | ECS cluster name or ARN to watch. Required when `TSSERVE_DISCOVERY=ecs`. |
 | `TSSERVE_ECS_POLL_INTERVAL` | No | `10s` | How often to poll the ECS API for task changes. Go duration format. |
 | `AWS_REGION` | ✱✱✱ | — | Standard AWS env var. Required when `TSSERVE_DISCOVERY=ecs` if not derivable from instance metadata or IAM role. |
+| **Observability** | | | |
+| `TSSERVE_METRICS_ADDR` | No | `127.0.0.1:9090` | `host:port` for the loopback Prometheus listener that serves `/metrics`. Set to `""` to disable, or `0.0.0.0:9100` to expose to a remote scraper (the operator owns host-firewall enforcement in that case). |
+| `TSSERVE_TRAEFIK_PORT` | No | — | If set, the tailnet HTTPS listener proxies `/traefik` to `http://localhost:<port>`. Intended for reaching a co-located Traefik dashboard. Omit to disable. |
 
 ✱ One authentication method must be provided. ✱✱ Required for OAuth and OIDC modes. ✱✱✱ Required when `TSSERVE_DISCOVERY=ecs`.
 
@@ -564,6 +567,50 @@ When a container restarts, Docker emits `die` then `start`. The stop handler tea
 
 ---
 
+## Observability and local endpoints
+
+tsserve exposes a small in-process control surface on **two** local listeners. The split is deliberate: status and dashboards are tailnet-scoped (any peer that can resolve the node's hostname can reach them), while Prometheus metrics stay on the host loopback by default so scrape traffic never traverses the tailnet.
+
+### Tailnet HTTPS listener — `:443`
+
+Available at `https://<TSSERVE_HOSTNAME>.<tailnet>.ts.net/`. Uses `tsnet.Server.ListenTLS`, which provisions a TLS certificate for the node's own hostname automatically — the same MagicDNS/HTTPS Certificates prerequisites the service listeners already require. The listener is always on; no env var disables it.
+
+| Path | Purpose |
+|---|---|
+| `/` | Single-page HTML status: tailnet identity (hostname, FQDN, tailnet name, MagicDNS suffix, node IPs, backend state), discovery mode, uptime, build info, and a table of currently registered services (service name → backend → caps → container → registered time). No JavaScript, no external assets. |
+| `/traefik`, `/traefik/...` | Reverse proxy to `http://localhost:<TSSERVE_TRAEFIK_PORT>` with the `/traefik` prefix stripped before forwarding. Intended for reaching a Traefik dashboard on the same host. Returns 404 with a one-line hint when `TSSERVE_TRAEFIK_PORT` is not set. |
+| `/metrics` | 404 with a hint pointing at the loopback metrics listener. |
+
+**Traefik prefix-stripping caveat.** `StripPrefix("/traefik", ...)` works for assets Traefik serves at relative paths, but absolute-path links inside the dashboard bundle (e.g. `/api/...`) bypass the prefix and land back on tsserve's mux at `/api/`, where they will 404. Operators who need full fidelity should configure Traefik to serve the dashboard under a matching path prefix; tsserve does not rewrite response bodies.
+
+### Loopback HTTP listener — `TSSERVE_METRICS_ADDR` (default `127.0.0.1:9090`)
+
+| Path | Purpose |
+|---|---|
+| `/metrics` | Prometheus exposition served by `promhttp.HandlerFor` over a dedicated registry (no leakage from transitive deps). |
+| `/` | One-line `text/plain` hint pointing at `/metrics`. |
+
+Loopback binding is the security boundary; the endpoint has no authentication. Operators who set `TSSERVE_METRICS_ADDR=0.0.0.0:9090` to expose the endpoint to a remote scraper are responsible for host-firewall enforcement. Set `TSSERVE_METRICS_ADDR=""` to disable the listener entirely.
+
+### Metric inventory
+
+All counters and gauges are prefixed `tsserve_`. Histograms use the default Prometheus buckets.
+
+| Metric | Type | Labels | Notes |
+|---|---|---|---|
+| `tsserve_proxy_requests_total` | Counter | `service`, `method`, `code` | One increment per proxied HTTP request (the wrapped response status is the `code`, so backend 502s show up here). |
+| `tsserve_proxy_request_duration_seconds` | Histogram | `service`, `method` | Wall-clock time from handler entry to exit. |
+| `tsserve_proxy_request_bytes_total` | Counter | `service` | Bytes read from request bodies. |
+| `tsserve_proxy_response_bytes_total` | Counter | `service` | Bytes written to response bodies (does not include response headers). |
+| `tsserve_proxy_in_flight_requests` | Gauge | `service` | Currently executing handlers, by service. |
+| `tsserve_proxy_backend_errors_total` | Counter | `service`, `reason` | Backend errors observed by the reverse proxy's `ErrorHandler`. `reason` is a coarse classification: `timeout`, `connection-refused`, `dns`, `eof`, `other`. |
+| `tsserve_services_active` | Gauge | — | Number of Tailscale Services currently registered. |
+| `tsserve_build_info` | Gauge | `version`, `revision`, `go_version` (const) | Constant `1`. Useful for grouping in dashboards. |
+
+Standard `go_*` and `process_*` collectors are also registered.
+
+---
+
 ## Project Structure
 
 ```
@@ -579,6 +626,13 @@ tsserve/
 ├── proxy/
 │   ├── manager.go       # Service Manager: tsnet.Server + active service map
 │   └── reverseproxy.go  # Reverse proxy factory with error handling
+├── metrics/
+│   └── metrics.go       # Prometheus collectors + per-request middleware
+├── local/
+│   ├── server.go        # Tailnet HTTPS + loopback HTTP listeners
+│   ├── status.go        # Status page handler
+│   ├── status.html      # Embedded status page template
+│   └── traefik.go       # /traefik reverse proxy + env-var parsing
 ├── Dockerfile
 ├── go.mod
 ├── go.sum
@@ -600,7 +654,9 @@ The `Registrar` interface declared in `docker/watcher.go` is the seam between di
 | `github.com/aws/aws-sdk-go-v2/config` | AWS SDK config resolution (ECS discovery mode) |
 | `github.com/aws/aws-sdk-go-v2/service/ecs` | ECS API client: `ListTasks`, `DescribeTasks`, `DescribeTaskDefinition`, `DescribeContainerInstances` |
 | `github.com/aws/aws-sdk-go-v2/service/ec2` | EC2 API client: `DescribeInstances` for bridge-mode host IP resolution |
+| `github.com/prometheus/client_golang` | Prometheus collectors and `promhttp` exposition handler |
 | Go stdlib `net/http/httputil` | Reverse proxy |
+| Go stdlib `html/template` | Status page rendering |
 | Go stdlib `log/slog` | Structured logging |
 
 Notes:
