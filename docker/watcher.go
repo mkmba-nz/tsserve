@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
@@ -23,10 +24,20 @@ type Registrar interface {
 	Deregister(containerID string)
 }
 
+// dockerAPI is the subset of *client.Client the watcher uses. Tests substitute
+// a fake; production wires in the real client.
+type dockerAPI interface {
+	Ping(ctx context.Context) (types.Ping, error)
+	ContainerList(ctx context.Context, options container.ListOptions) ([]container.Summary, error)
+	ContainerInspect(ctx context.Context, containerID string) (container.InspectResponse, error)
+	Events(ctx context.Context, options events.ListOptions) (<-chan events.Message, <-chan error)
+	Close() error
+}
+
 // Watcher subscribes to Docker events and drives the [Registrar] in response
 // to container lifecycle changes.
 type Watcher struct {
-	cli      *client.Client
+	cli      dockerAPI
 	reg      Registrar
 	logger   *slog.Logger
 	settleFn func() // injectable for tests; real impl sleeps 1s before resolving IP

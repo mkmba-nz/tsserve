@@ -26,10 +26,16 @@ import (
 	"mkmba.nz/tsserve/proxy"
 )
 
+// Snapshotter is the read-only manager surface used by the status page.
+// *proxy.Manager satisfies this; tests can substitute a fake.
+type Snapshotter interface {
+	Snapshot() []proxy.ServiceView
+}
+
 // Server owns both local listeners (tailnet HTTPS + loopback HTTP metrics).
 type Server struct {
 	Logger        *slog.Logger
-	Manager       *proxy.Manager
+	Manager       Snapshotter
 	LocalClient   *local.Client
 	Metrics       *metrics.Collector
 	TraefikPort   int    // 0 = disabled

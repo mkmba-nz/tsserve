@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -27,9 +28,12 @@ func (e *FatalError) Unwrap() error { return e.err }
 // Manager owns the tsnet.Server and the live set of Tailscale Service
 // listeners and reverse proxies. It is safe for concurrent use.
 type Manager struct {
-	srv     *tsnet.Server
-	logger  *slog.Logger
-	metrics *metrics.Collector
+	// listenSvc opens a Tailscale Service listener. In production this calls
+	// (*tsnet.Server).ListenService; tests swap it for an in-memory listener
+	// factory.
+	listenSvc func(name string, mode tsnet.ServiceMode) (net.Listener, error)
+	logger    *slog.Logger
+	metrics   *metrics.Collector
 
 	mu       sync.Mutex
 	byCID    map[string]*activeService // containerID -> service
@@ -73,7 +77,9 @@ type ServiceView struct {
 // mc may be nil; when nil no metrics are recorded.
 func NewManager(srv *tsnet.Server, logger *slog.Logger, mc *metrics.Collector) *Manager {
 	return &Manager{
-		srv:     srv,
+		listenSvc: func(name string, mode tsnet.ServiceMode) (net.Listener, error) {
+			return srv.ListenService(name, mode)
+		},
 		logger:  logger,
 		metrics: mc,
 		byCID:   map[string]*activeService{},
@@ -122,7 +128,7 @@ func (m *Manager) Register(containerID string, def *ServiceDef, backendIP string
 		mode.AcceptAppCaps = map[string][]string{"/": def.Caps}
 	}
 
-	ln, err := m.srv.ListenService(def.Service, mode)
+	ln, err := m.listenSvc(def.Service, mode)
 	if err != nil {
 		if isMagicDNSError(err) {
 			return &FatalError{err: fmt.Errorf(
