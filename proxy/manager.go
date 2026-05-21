@@ -204,6 +204,11 @@ func isMagicDNSError(err error) bool {
 }
 
 func short(id string) string {
+	// Strip ARN-style path prefix so ECS task ARNs log their task UUID
+	// rather than the constant "arn:aws:ecs:" prefix.
+	if i := strings.LastIndexByte(id, '/'); i >= 0 {
+		id = id[i+1:]
+	}
 	if len(id) > 12 {
 		return id[:12]
 	}

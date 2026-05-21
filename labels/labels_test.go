@@ -1,12 +1,13 @@
-package docker
+package labels
 
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
-func TestParseLabels(t *testing.T) {
+func TestParse(t *testing.T) {
 	tests := []struct {
 		name    string
 		labels  map[string]string
@@ -91,7 +92,7 @@ func TestParseLabels(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParseLabels(tt.labels)
+			got, err := Parse(tt.labels)
 			if tt.wantErr != "" {
 				if err == nil {
 					t.Fatalf("want error containing %q, got nil; def=%+v", tt.wantErr, got)
@@ -102,7 +103,7 @@ func TestParseLabels(t *testing.T) {
 					}
 					return
 				}
-				if !contains(err.Error(), tt.wantErr) {
+				if !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("error %q does not contain %q", err.Error(), tt.wantErr)
 				}
 				return
@@ -115,13 +116,4 @@ func TestParseLabels(t *testing.T) {
 			}
 		})
 	}
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

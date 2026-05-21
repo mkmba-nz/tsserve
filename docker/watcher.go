@@ -1,3 +1,5 @@
+// Package docker contains the Docker integration: event subscription and
+// container IP resolution. Label parsing lives in the shared labels/ package.
 package docker
 
 import (
@@ -10,12 +12,14 @@ import (
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
+
+	"mkmba.nz/tsserve/labels"
 )
 
 // Registrar is implemented by the proxy package. The watcher calls Register
 // when a labelled container becomes ready and Deregister when one goes away.
 type Registrar interface {
-	Register(containerID string, def *ServiceDef, backendIP string) error
+	Register(containerID string, def *labels.ServiceDef, backendIP string) error
 	Deregister(containerID string)
 }
 
@@ -79,7 +83,7 @@ func (w *Watcher) scanExisting(ctx context.Context) error {
 		return err
 	}
 	for _, c := range cs {
-		def, err := ParseLabels(c.Labels)
+		def, err := labels.Parse(c.Labels)
 		if err != nil {
 			continue
 		}
@@ -102,7 +106,7 @@ func (w *Watcher) handleEvent(ctx context.Context, msg events.Message) {
 	}
 }
 
-func (w *Watcher) inspect(ctx context.Context, id string) (*ServiceDef, error) {
+func (w *Watcher) inspect(ctx context.Context, id string) (*labels.ServiceDef, error) {
 	insp, err := w.cli.ContainerInspect(ctx, id)
 	if err != nil {
 		return nil, err
@@ -110,10 +114,10 @@ func (w *Watcher) inspect(ctx context.Context, id string) (*ServiceDef, error) {
 	if insp.Config == nil {
 		return nil, fmt.Errorf("container %s: no config", id)
 	}
-	return ParseLabels(insp.Config.Labels)
+	return labels.Parse(insp.Config.Labels)
 }
 
-func (w *Watcher) register(ctx context.Context, id string, def *ServiceDef) {
+func (w *Watcher) register(ctx context.Context, id string, def *labels.ServiceDef) {
 	ip, err := w.resolveIP(ctx, id, def.Network)
 	if err != nil {
 		w.logger.Warn("could not resolve container IP",

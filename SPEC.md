@@ -11,7 +11,8 @@ A single-binary Docker-to-Tailscale-Services proxy built on `tsnet`.
 - **Single binary/container** — no external `tailscaled` daemon required. `tsnet` is compiled in.
 - **Tailscale Services, not machines** — uses `tsnet.Server.ListenService`, so the tailnet device list stays clean. Each backend gets its own `svc:` entry, not a machine.
 - **HTTPS by default** — all services are exposed over HTTPS with automatic TLS certificates from Let's Encrypt via Tailscale's built-in cert provisioning. Clients access services at `https://servicename.tailnet.ts.net`. This requires MagicDNS and HTTPS to be enabled in the Tailscale admin console.
-- **Minimal scope** — Docker label discovery, reverse proxying, lifecycle management. Nothing else.
+- **Flexible discovery** — labelled containers can be discovered via a local Docker socket (single-host deployments) or via the AWS ECS API (multi-host clusters where Tailscale must not run on the container hosts). The `tsserve.*` label vocabulary is identical across modes.
+- **Minimal scope** — label-driven discovery, reverse proxying, lifecycle management. Nothing else.
 
 ## Non-goals
 
@@ -182,8 +183,13 @@ tsserve supports three authentication modes. The first matching mode wins, check
 | `TSSERVE_HOSTNAME` | No | `tsserve` | The hostname for the tsnet node on the tailnet. |
 | `TSSERVE_STATE_DIR` | No | `/var/lib/tsserve` | Directory for tsnet state persistence across restarts. |
 | `TSSERVE_LOG_LEVEL` | No | `info` | Log level: `debug`, `info`, `warn`, `error`. |
+| **Discovery** | | | |
+| `TSSERVE_DISCOVERY` | No | `docker` | Discovery backend. `docker` reads `/var/run/docker.sock`. `ecs` queries the AWS ECS API. See [ECS Cluster Mode](#ecs-cluster-mode). |
+| `TSSERVE_ECS_CLUSTER` | ✱✱✱ | — | ECS cluster name or ARN to watch. Required when `TSSERVE_DISCOVERY=ecs`. |
+| `TSSERVE_ECS_POLL_INTERVAL` | No | `10s` | How often to poll the ECS API for task changes. Go duration format. |
+| `AWS_REGION` | ✱✱✱ | — | Standard AWS env var. Required when `TSSERVE_DISCOVERY=ecs` if not derivable from instance metadata or IAM role. |
 
-✱ One authentication method must be provided. ✱✱ Required for OAuth and OIDC modes.
+✱ One authentication method must be provided. ✱✱ Required for OAuth and OIDC modes. ✱✱✱ Required when `TSSERVE_DISCOVERY=ecs`.
 
 ### ECS Deployment Example
 
@@ -241,9 +247,189 @@ tsnet handles the token exchange, key generation, and node registration internal
 
 ---
 
+## ECS Cluster Mode
+
+When `TSSERVE_DISCOVERY=ecs`, tsserve discovers backends by querying the AWS ECS API instead of a local Docker socket. This is the deployment topology for clusters where Tailscale must not run on the container hosts.
+
+### When to use this mode
+
+- tsserve runs on a dedicated proxy host (typically a small EC2 instance in a border VPC).
+- Containers run on a separate, locked-down ECS cluster (EC2 launch type) in another VPC.
+- ECS hosts have no internet egress and must not initiate any connection to the Tailscale control plane.
+- One tsserve instance proxies for many ECS hosts and many tasks across the cluster.
+
+The Docker discovery path is unchanged and remains the recommended choice for single-host deployments (local dev, Docker Compose, a single VM running both Docker and tsserve).
+
+### Deployment topology
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ Border VPC                                                          │
+│                                                                     │
+│   ┌────────────────────────────────────────────────────────────┐    │
+│   │ Proxy host (EC2)                                           │    │
+│   │   tsserve                                                  │    │
+│   │     tsnet.Server ─────────────────────▶ Tailscale (HTTPS)  │    │
+│   │     ecs.Watcher  ──────▶ AWS ECS / EC2 APIs                │    │
+│   │     Manager + ReverseProxy ───┐                            │    │
+│   └───────────────────────────────┼────────────────────────────┘    │
+└───────────────────────────────────┼─────────────────────────────────┘
+                                    │ VPC peering / Transit Gateway
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ ECS VPC (private; no internet egress; no Tailscale)                 │
+│                                                                     │
+│   ┌──────────────────────────┐   ┌──────────────────────────┐       │
+│   │ EC2 host (ECS-managed)   │   │ EC2 host (ECS-managed)   │  ...  │
+│   │   bridge tasks           │   │   awsvpc tasks           │       │
+│   │   reachable at           │   │   reachable at           │       │
+│   │   hostIP:hostPort        │   │   eniIP:containerPort    │       │
+│   └──────────────────────────┘   └──────────────────────────┘       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+The ECS hosts are strictly passive: they accept inbound TCP from the proxy host's security group and originate nothing. All Tailscale traffic, all AWS API calls, and all reverse-proxying terminate on the proxy host.
+
+### Network requirements
+
+- **Cross-VPC reachability**: VPC peering, Transit Gateway, or PrivateLink between the border VPC and the ECS VPC. The proxy host must be able to open TCP connections to task IPs (awsvpc mode) or ECS host private IPs (bridge mode).
+- **Security groups**: ECS task ENIs (awsvpc) or container instance SGs (bridge) must allow inbound TCP from the proxy host's SG on the labelled ports.
+- **AWS API access**: the proxy host needs egress to the regional ECS and EC2 endpoints. Either via the border VPC's existing internet egress or via interface VPC endpoints (`com.amazonaws.<region>.ecs`, `com.amazonaws.<region>.ec2`) in the border VPC. No endpoints are required in the ECS VPC.
+
+### IAM permissions
+
+The proxy host's IAM role (or AWS credentials supplied via the standard SDK env vars) must permit:
+
+| Action | Purpose |
+|---|---|
+| `ecs:ListTasks` | Enumerate running tasks in the configured cluster. |
+| `ecs:DescribeTasks` | Read task metadata, network bindings, and ENI attachments. |
+| `ecs:DescribeTaskDefinition` | Read `containerDefinitions[*].dockerLabels` — the source of truth for `tsserve.*` labels. |
+| `ecs:DescribeContainerInstances` | Resolve `containerInstanceArn` → `ec2InstanceId` for bridge-mode tasks. |
+| `ec2:DescribeInstances` | Resolve EC2 instance ID → private IPv4 for bridge-mode forwarding. |
+
+For deployments running awsvpc tasks exclusively, the last two actions can be omitted.
+
+Scope the IAM policy to the specific cluster ARN where possible; `ecs:Describe*` actions accept resource ARN conditions.
+
+### Where labels live
+
+Docker labels on ECS tasks are declared in the task definition under `containerDefinitions[*].dockerLabels`. The same `tsserve.*` vocabulary documented in [Docker Labels](#docker-labels) applies, with one exception:
+
+- `tsserve.network` is **ignored in ECS mode**. The network mode is determined by the task definition (`networkMode: bridge` or `networkMode: awsvpc`), not by a label.
+
+Example task definition:
+
+```json
+{
+  "family": "myapi",
+  "networkMode": "bridge",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "myapi:latest",
+      "portMappings": [{ "containerPort": 3000, "hostPort": 0, "protocol": "tcp" }],
+      "dockerLabels": {
+        "tsserve.enable": "true",
+        "tsserve.service": "svc:api",
+        "tsserve.port": "3000",
+        "tsserve.caps": "example.com/cap/read,example.com/cap/admin"
+      }
+    }
+  ]
+}
+```
+
+`tsserve.port` is always the **container port** (the port the application listens on inside the container), in both bridge and awsvpc modes. tsserve handles the host-port lookup internally for bridge mode.
+
+### Backend resolution
+
+The ECS watcher branches on the task definition's `networkMode`:
+
+**Bridge mode** (`networkMode: "bridge"`):
+1. The task runs on a container instance. Container ports are exposed at dynamic host ports.
+2. For the labelled container, find the entry in `task.containers[*].networkBindings` where `containerPort == tsserve.port`. Use its `hostPort`.
+3. Resolve the host's private IP: `task.containerInstanceArn` → `DescribeContainerInstances` → `ec2InstanceId` → `DescribeInstances` → `privateIpAddress`.
+4. Forward to `hostPrivateIP:hostPort`.
+
+**awsvpc mode** (`networkMode: "awsvpc"`):
+1. Each task has its own ENI. Find the attachment of type `ElasticNetworkInterface` in `task.attachments`.
+2. Read `privateIPv4Address` from the attachment's `details`.
+3. Forward to `eniPrivateIP:tsserve.port` (no port translation needed).
+
+Either way, the reverse-proxy layer (`proxy.Manager`, `proxy.reverseproxy`) receives a `host:port` string and is unchanged from the Docker-mode case.
+
+### Caching
+
+To keep ECS API call volume bounded:
+
+- **Task definitions** are immutable per ARN; cache `DescribeTaskDefinition` results indefinitely, keyed by ARN.
+- **Container instance → EC2 host private IP** mappings are long-lived; cache for the lifetime of the host. Invalidate on lookup failure.
+
+### Lifecycle (polling model)
+
+v1 uses a poll-and-diff loop; no EventBridge integration:
+
+1. Every `TSSERVE_ECS_POLL_INTERVAL` (default `10s`):
+   - `ListTasks(cluster, desiredStatus=RUNNING)` → `DescribeTasks(taskArns)`.
+   - Filter to tasks whose task definition has at least one container with `tsserve.enable=true`.
+   - Compute diff against the current set of registered task ARNs.
+2. For new task ARNs: resolve backend (per "Backend resolution" above) and call `Manager.Register(taskArn, def, backend)`.
+3. For disappeared task ARNs: call `Manager.Deregister(taskArn)`.
+4. Tasks with unchanged ARN are a no-op (task ARNs are stable; a redeploy produces new ARNs).
+
+This is sufficient at typical proxy latencies (a ~10s lag between a task starting and becoming reachable is acceptable; the reverse proxy already returns 502 if the backend isn't up yet, which is identical to the Docker-mode behaviour). EventBridge-driven fast updates are listed under [Future Extensions](#future-extensions-out-of-scope-for-v1).
+
+### API quota notes
+
+`ListTasks` and `DescribeTasks` share a single account-wide, per-region token bucket — the "Cluster resource read actions" category — with a burst of 100 and a sustained rate of 20 requests/sec. Default 10s polling stays under 2 requests/sec for clusters up to ~1,000 tasks. Raise `TSSERVE_ECS_POLL_INTERVAL` (suggested 30s) for larger clusters, or adopt the EventBridge fast path. These rate limits are documented in the ECS API Reference but are **not** exposed as AWS Service Quotas codes — increases require an AWS Support ticket. The watcher uses the SDK's adaptive retry mode so a transient `ThrottlingException` is absorbed without crashing; the next poll cycle reconciles whatever was missed.
+
+### Example: proxy task definition
+
+The proxy itself can run as a small ECS task in the border VPC, using workload identity federation:
+
+```json
+{
+  "family": "tsserve-proxy",
+  "networkMode": "awsvpc",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/tsserve-proxy",
+  "containerDefinitions": [
+    {
+      "name": "tsserve",
+      "image": "ghcr.io/you/tsserve:latest",
+      "essential": true,
+      "environment": [
+        {"name": "TSSERVE_DISCOVERY",     "value": "ecs"},
+        {"name": "TSSERVE_ECS_CLUSTER",   "value": "prod-apps"},
+        {"name": "AWS_REGION",            "value": "us-east-1"},
+        {"name": "TS_CLIENT_ID",          "value": "<federated-identity-client-id>"},
+        {"name": "TS_AUDIENCE",           "value": "<federated-identity-audience>"},
+        {"name": "TSSERVE_TAGS",          "value": "tag:tsserve"}
+      ],
+      "mountPoints": [
+        {"sourceVolume": "tsserve-state", "containerPath": "/var/lib/tsserve"}
+      ]
+    }
+  ],
+  "volumes": [
+    {"name": "tsserve-state", "efsVolumeConfiguration": {"fileSystemId": "fs-..."}}
+  ]
+}
+```
+
+The proxy task role (`tsserve-proxy`) carries both the Tailscale workload identity federation subject claim and the AWS IAM permissions listed above. No static credentials anywhere.
+
+### Known v1 limitations
+
+- **Replica fan-out is not supported.** If an ECS service runs N replicas of a task definition that declares `tsserve.service=svc:api`, only the first task discovered will back the service; the others are logged as duplicates and ignored (consistent with `proxy.Manager`'s existing "first wins" behaviour — see `proxy/manager.go:86`). For services that need load-balanced fan-out, run an internal NLB or ALB in the ECS VPC and label a single "shim" task that forwards to it. See [Future Extensions](#future-extensions-out-of-scope-for-v1).
+
+---
+
 ## Core Components
 
-### 1. Docker Watcher
+Exactly one watcher is active per tsserve process, chosen at startup by `TSSERVE_DISCOVERY`. Both watchers feed the same `Registrar` interface consumed by the Service Manager, so the manager and reverse proxy are unaware of the discovery backend.
+
+### 1a. Docker Watcher (`TSSERVE_DISCOVERY=docker`)
 
 Connects to the Docker daemon via the Docker socket and monitors container lifecycle events.
 
@@ -257,6 +443,25 @@ Connects to the Docker daemon via the Docker socket and monitors container lifec
 - Use the `github.com/docker/docker/client` Go SDK.
 - Filter events to container types only.
 - When a container starts, wait briefly (e.g. 1s) for its network to be ready before resolving its IP.
+
+### 1b. ECS Watcher (`TSSERVE_DISCOVERY=ecs`)
+
+Queries the AWS ECS API on a fixed interval and drives the same `Registrar` interface as the Docker watcher. See [ECS Cluster Mode](#ecs-cluster-mode) for the user-facing description; this section covers implementation.
+
+**Responsibilities:**
+- On startup, list all running tasks in `TSSERVE_ECS_CLUSTER` and register any whose task definition declares `tsserve.enable=true` on at least one container.
+- Every `TSSERVE_ECS_POLL_INTERVAL`, repeat the list/diff and apply additions and removals.
+- For each labelled container in a task, resolve the backend `host:port` based on the task definition's `networkMode` (bridge or awsvpc).
+- Pass discovered service definitions to the Service Manager.
+
+**Implementation notes:**
+- Use the AWS SDK for Go v2 (`github.com/aws/aws-sdk-go-v2/service/ecs` and `.../service/ec2`). Standard SDK config resolution (env, shared config, EC2 IMDS, ECS task role) handles credentials.
+- Use task ARN (not container ID) as the registration key, since ECS has no container-ID equivalent for the lifetime of a task.
+- Cache `DescribeTaskDefinition` results indefinitely by ARN (task defs are immutable per revision).
+- Cache container-instance → EC2 instance ID → private IP mappings; refresh on miss.
+- Skip tasks that lack `tsserve.enable=true`. Skip tasks that haven't reached `lastStatus=RUNNING`.
+- When a task definition declares multiple containers with `tsserve.enable=true`, treat each (taskArn, containerName) pair as a separate registration. Use a composite registration key like `taskArn#containerName`.
+- Handle ECS API throttling: SDK retries with exponential backoff are sufficient at expected scales (a few `Describe*` calls per poll cycle).
 
 ### 2. Service Manager
 
@@ -298,14 +503,16 @@ A standard Go `net/http/httputil.ReverseProxy` per service.
 
 ## Lifecycle Handling
 
+The "Container Start / Stop / Restart" subsections below describe Docker mode. The ECS mode lifecycle is poll-driven and is described in [ECS Cluster Mode → Lifecycle (polling model)](#lifecycle-polling-model). The shared parts — startup, shutdown, and how the Service Manager reacts to register/deregister calls — are documented here.
+
 ### Startup
 
 1. Parse environment variables. Validate that at least one authentication method is configured.
 2. Initialise `tsnet.Server` with all configured fields (`Hostname`, `Dir`, `AuthKey`, `ClientID`, `ClientSecret`, `IDToken`, `Audience`, `AdvertiseTags`). Call `srv.Start()`. tsnet handles authentication internally — OIDC token exchange, OAuth key generation, or auth key login.
 3. Wait for tsnet to be ready (connected to tailnet).
 4. Obtain `LocalClient` via `srv.LocalClient()` for the status-page tailnet view.
-5. Start the Docker Watcher. List existing containers and register services.
-6. Begin listening for Docker events.
+5. Select the watcher based on `TSSERVE_DISCOVERY` (`docker` or `ecs`).
+6. Start the watcher. It performs an initial enumeration (Docker: `ContainerList` + event subscription; ECS: `ListTasks` + the first poll) and registers any qualifying backends.
 
 ### Container Start
 
@@ -345,9 +552,15 @@ When a container restarts, Docker emits `die` then `start`. The stop handler tea
 | `ListenService` fails because HTTPS/MagicDNS not enabled | Fatal error on first occurrence. Exit with a clear message telling the user to enable HTTPS and MagicDNS in the admin console. |
 | Container IP cannot be resolved | Log warning. Skip this container. Retry on next Docker event for this container. |
 | Backend unreachable (container crashed but event not yet received) | Reverse proxy returns 502 to the client. Normal behaviour. |
-| Docker socket unavailable at startup | Fatal error. Exit with message. |
+| Docker socket unavailable at startup (Docker mode) | Fatal error. Exit with message. |
+| ECS `DescribeTasks` returns `AccessDeniedException` (ECS mode) | Fatal error on first occurrence. Exit with message naming the IAM action that was denied. |
+| ECS `TSSERVE_ECS_CLUSTER` does not exist (ECS mode) | Fatal error. Exit with message. |
+| ECS API throttling (`ThrottlingException`, `RequestLimitExceeded`) | Rely on SDK retry-with-backoff. If a poll cycle still fails after retries, log a warning and continue; the next poll will catch up. Do not crash. |
+| Bridge-mode task with no `networkBinding` matching `tsserve.port` | Log warning naming the task ARN and labelled port. Skip this container. Retry on next poll cycle. |
+| awsvpc-mode task with no `ElasticNetworkInterface` attachment yet | Log debug message. Skip this poll. The next cycle will pick it up once the ENI is attached. |
+| `ec2:DescribeInstances` fails for a container instance (ECS mode) | Log warning. Skip this container. Cached host IPs are invalidated on failure so the next poll retries cleanly. |
 | `tsnet.Server.Start()` fails (e.g. bad auth key, OIDC token exchange failure, expired credentials) | Fatal error. Exit with message. For OIDC failures, suggest checking the federated identity configuration in the Tailscale admin console. |
-| Duplicate `tsserve.service` on two containers | First one wins. Log a warning for the duplicate. If the first stops, the second does NOT auto-register (it would need to be restarted). |
+| Duplicate `tsserve.service` on two containers (Docker mode) or two tasks (ECS mode) | First one wins. Log a warning for the duplicate. If the first stops, the second does NOT auto-register (it would need to be restarted, or ECS mode would need to rediscover it on the next poll cycle). |
 
 ---
 
@@ -355,10 +568,14 @@ When a container restarts, Docker emits `die` then `start`. The stop handler tea
 
 ```
 tsserve/
-├── main.go              # Entry point, signal handling, wiring
+├── main.go              # Entry point, signal handling, watcher selection, wiring
 ├── docker/
 │   ├── watcher.go       # Docker event subscription and container inspection
-│   └── labels.go        # Label parsing and validation
+│   └── labels.go        # Label parsing and validation (shared with ecs/)
+├── ecs/
+│   ├── watcher.go       # ECS poll-and-diff loop; drives the same Registrar
+│   ├── resolve.go       # Backend resolution: bridge (host:hostPort) vs awsvpc (eni:containerPort)
+│   └── cache.go         # Task-definition and container-instance → host-IP caches
 ├── proxy/
 │   ├── manager.go       # Service Manager: tsnet.Server + active service map
 │   └── reverseproxy.go  # Reverse proxy factory with error handling
@@ -368,6 +585,8 @@ tsserve/
 └── README.md
 ```
 
+The `Registrar` interface declared in `docker/watcher.go` is the seam between discovery and proxying. The ECS watcher implements no new contract; it satisfies the same interface. Label parsing is shared — `docker/labels.go` operates on `map[string]string`, which is the shape of both Docker's `Config.Labels` and ECS's `containerDefinitions[*].dockerLabels`.
+
 ---
 
 ## Dependencies
@@ -376,12 +595,17 @@ tsserve/
 |---|---|
 | `tailscale.com/tsnet` | Embedded Tailscale node, `ListenService` API, `LocalClient` for the status page tailnet view |
 | `tailscale.com/client/tailscale` | `LocalClient` type used by the status page |
-| `github.com/docker/docker/client` | Docker daemon API client |
+| `github.com/docker/docker/client` | Docker daemon API client (Docker discovery mode) |
 | `github.com/docker/docker/api/types` | Docker API types for events and container inspection |
+| `github.com/aws/aws-sdk-go-v2/config` | AWS SDK config resolution (ECS discovery mode) |
+| `github.com/aws/aws-sdk-go-v2/service/ecs` | ECS API client: `ListTasks`, `DescribeTasks`, `DescribeTaskDefinition`, `DescribeContainerInstances` |
+| `github.com/aws/aws-sdk-go-v2/service/ec2` | EC2 API client: `DescribeInstances` for bridge-mode host IP resolution |
 | Go stdlib `net/http/httputil` | Reverse proxy |
 | Go stdlib `log/slog` | Structured logging |
 
-Note: `tailscale.com/client/tailscale` is pulled in transitively by `tailscale.com/tsnet` — it's not an additional module dependency, just an additional import path within the same module.
+Notes:
+- `tailscale.com/client/tailscale` is pulled in transitively by `tailscale.com/tsnet` — it's not an additional module dependency, just an additional import path within the same module.
+- The AWS SDK is only imported by the `ecs/` package. Builds intended for Docker-only deployments can use a build tag to exclude it if image size matters; the default build includes both watchers.
 
 ---
 
@@ -485,6 +709,9 @@ These are explicitly not part of the initial implementation but noted for future
 - **Health checks** — verify backend is reachable before advertising the service.
 - **Multiple services per container** — indexed labels like `tsserve.1.service`, `tsserve.1.port`.
 - **Path-scoped app capabilities** — allow per-path capability mounts (e.g. `tsserve.caps./foo=example.com/cap/foo`) instead of the current all-at-root approach.
+- **EventBridge-driven ECS updates** — subscribe to `ECS Task State Change` events via EventBridge → SQS for sub-second lifecycle reaction in cluster mode, instead of the v1 polling loop. Polling remains as a reconciliation fallback.
+- **ECS replica fan-out** — when multiple tasks share a `tsserve.service` value (e.g. an ECS service with `desiredCount > 1`), advertise the service once and load-balance requests across all healthy task backends, rather than the current "first task wins" behaviour. Likely involves extending `proxy.Manager` to hold a small per-service backend pool.
+- **Fargate launch-type support** — the ECS watcher's awsvpc code path already handles Fargate's task-IP shape, but Fargate has additional constraints (no container-instance ARN, no host-IP fallback, IAM via task role only) that need explicit testing and a documented setup path.
 
 ---
 

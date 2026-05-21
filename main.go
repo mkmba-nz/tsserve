@@ -1,6 +1,6 @@
-// Command tsserve watches Docker for labelled containers and exposes them as
-// Tailscale Services using the tsnet ListenService API. See SPEC.md for full
-// details.
+// Command tsserve watches Docker or AWS ECS for labelled containers and
+// exposes them as Tailscale Services using the tsnet ListenService API. See
+// SPEC.md for full details.
 package main
 
 import (
@@ -12,10 +12,17 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/aws"
+	awsconfigload "github.com/aws/aws-sdk-go-v2/config"
+	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
+	awsecs "github.com/aws/aws-sdk-go-v2/service/ecs"
 	"tailscale.com/tsnet"
 
 	dockerpkg "mkmba.nz/tsserve/docker"
+	"mkmba.nz/tsserve/ecs"
+	"mkmba.nz/tsserve/labels"
 	"mkmba.nz/tsserve/proxy"
 )
 
@@ -69,14 +76,10 @@ func run() error {
 	fatal := make(chan error, 1)
 	registrar := &registrarAdapter{mgr: mgr, fatal: fatal}
 
-	watcher, err := dockerpkg.NewWatcher(registrar, logger)
-	if err != nil {
+	watchErr := make(chan error, 1)
+	if err := startWatcher(ctx, registrar, logger, watchErr); err != nil {
 		return err
 	}
-	defer watcher.Close()
-
-	watchErr := make(chan error, 1)
-	go func() { watchErr <- watcher.Run(ctx) }()
 
 	logger.Info("tsserve ready")
 	select {
@@ -98,7 +101,7 @@ type registrarAdapter struct {
 	fatal chan<- error
 }
 
-func (a *registrarAdapter) Register(containerID string, def *dockerpkg.ServiceDef, backendIP string) error {
+func (a *registrarAdapter) Register(containerID string, def *labels.ServiceDef, backendIP string) error {
 	err := a.mgr.Register(containerID, &proxy.ServiceDef{
 		Service: def.Service,
 		Port:    def.Port,
@@ -116,6 +119,72 @@ func (a *registrarAdapter) Register(containerID string, def *dockerpkg.ServiceDe
 }
 
 func (a *registrarAdapter) Deregister(containerID string) { a.mgr.Deregister(containerID) }
+
+// startWatcher selects and starts the configured discovery backend, sending
+// its terminal error (or nil on clean shutdown) on watchErr.
+func startWatcher(ctx context.Context, registrar *registrarAdapter, logger *slog.Logger, watchErr chan<- error) error {
+	mode := strings.ToLower(envDefault("TSSERVE_DISCOVERY", "docker"))
+	switch mode {
+	case "docker":
+		watcher, err := dockerpkg.NewWatcher(registrar, logger)
+		if err != nil {
+			return err
+		}
+		go func() {
+			defer watcher.Close()
+			watchErr <- watcher.Run(ctx)
+		}()
+		return nil
+
+	case "ecs":
+		cluster := os.Getenv("TSSERVE_ECS_CLUSTER")
+		if cluster == "" {
+			return errors.New("TSSERVE_ECS_CLUSTER is required when TSSERVE_DISCOVERY=ecs")
+		}
+		interval, err := parsePollInterval(os.Getenv("TSSERVE_ECS_POLL_INTERVAL"))
+		if err != nil {
+			return err
+		}
+
+		awsCfg, err := awsconfigload.LoadDefaultConfig(ctx,
+			awsconfigload.WithRetryMode(awsconfig.RetryModeAdaptive),
+			awsconfigload.WithRetryMaxAttempts(5),
+		)
+		if err != nil {
+			return fmt.Errorf("aws config: %w", err)
+		}
+
+		watcher, err := ecs.NewWatcher(
+			ecs.Config{Cluster: cluster, PollInterval: interval},
+			awsecs.NewFromConfig(awsCfg),
+			awsec2.NewFromConfig(awsCfg),
+			registrar,
+			logger,
+		)
+		if err != nil {
+			return err
+		}
+		go func() { watchErr <- watcher.Run(ctx) }()
+		return nil
+
+	default:
+		return fmt.Errorf("unknown TSSERVE_DISCOVERY=%q; expected 'docker' or 'ecs'", mode)
+	}
+}
+
+func parsePollInterval(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, nil // 0 lets ecs.NewWatcher pick the default
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("TSSERVE_ECS_POLL_INTERVAL=%q: %w", s, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("TSSERVE_ECS_POLL_INTERVAL must be positive, got %s", s)
+	}
+	return d, nil
+}
 
 func validateAuth() error {
 	authKey := os.Getenv("TS_AUTHKEY")
