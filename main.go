@@ -185,10 +185,22 @@ func startWatcher(ctx context.Context, mode string, registrar *registrarAdapter,
 			return err
 		}
 
-		awsCfg, err := awsconfigload.LoadDefaultConfig(ctx,
+		// Scope ECS AWS config to tsserve-specific env vars so the
+		// process-wide AWS_PROFILE / AWS_CONFIG_FILE do not leak into
+		// tsnet's WIF flow (which calls LoadDefaultConfig itself and
+		// must resolve to the EC2 instance role identity Tailscale
+		// trusts, not a cross-account role assumed for ECS reads).
+		ecsOpts := []func(*awsconfigload.LoadOptions) error{
 			awsconfigload.WithRetryMode(awsconfig.RetryModeAdaptive),
 			awsconfigload.WithRetryMaxAttempts(5),
-		)
+		}
+		if p := os.Getenv("TSSERVE_ECS_AWS_PROFILE"); p != "" {
+			ecsOpts = append(ecsOpts, awsconfigload.WithSharedConfigProfile(p))
+		}
+		if f := os.Getenv("TSSERVE_ECS_AWS_CONFIG_FILE"); f != "" {
+			ecsOpts = append(ecsOpts, awsconfigload.WithSharedConfigFiles([]string{f}))
+		}
+		awsCfg, err := awsconfigload.LoadDefaultConfig(ctx, ecsOpts...)
 		if err != nil {
 			return fmt.Errorf("aws config: %w", err)
 		}
