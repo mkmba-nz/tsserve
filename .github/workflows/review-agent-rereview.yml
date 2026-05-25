@@ -1,0 +1,16 @@
+name: Review Agent (Re-review)
+
+on:
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  rereview:
+    if: |
+      (contains(github.event.comment.body, '@mkmba-review-agent') ||
+       contains(github.event.comment.body, '@review-agent')) &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    uses: mkmba-nz/github-infra/.github/workflows/review-agent.yml@v1
+    secrets: inherit
+    with:
+      mode: requested

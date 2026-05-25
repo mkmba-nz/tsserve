@@ -1,0 +1,10 @@
+name: Review Agent
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+jobs:
+  review:
+    uses: mkmba-nz/github-infra/.github/workflows/review-agent.yml@v1
+    secrets: inherit

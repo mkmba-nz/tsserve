@@ -1,0 +1,30 @@
+name: compliance
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  compliance-tests:
+    permissions:
+      checks: read
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Review gate
+      id: review-gate
+      uses: mkmba-nz/github-infra/actions/review-gate@HEAD
+
+    - name: Set up Go
+      if: steps.review-gate.outputs.should_skip != 'true'
+      uses: mkmba-nz/github-infra/actions/setup-go@HEAD
+
+    - name: Run go tests
+      if: steps.review-gate.outputs.should_skip != 'true'
+      run: go test ./...
