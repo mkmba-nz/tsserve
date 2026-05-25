@@ -10,7 +10,7 @@ jobs:
       (contains(github.event.comment.body, '@mkmba-review-agent') ||
        contains(github.event.comment.body, '@review-agent')) &&
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
-    uses: mkmba-nz/github-infra/.github/workflows/review-agent.yml@HEAD
+    uses: mkmba-nz/github-infra/.github/workflows/review-agent.yml@main
     secrets: inherit
     with:
       mode: requested
