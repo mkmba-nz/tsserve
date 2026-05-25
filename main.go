@@ -18,6 +18,11 @@ import (
 	awsconfigload "github.com/aws/aws-sdk-go-v2/config"
 	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
 	awsecs "github.com/aws/aws-sdk-go-v2/service/ecs"
+	// Register tsnet auth-key resolvers. Without these blank imports the
+	// TS_CLIENT_ID/TS_AUDIENCE (WIF) and TS_CLIENT_ID/TS_CLIENT_SECRET (OAuth)
+	// modes are silent no-ops and tsnet falls through to interactive login.
+	_ "tailscale.com/feature/condregister/identityfederation"
+	_ "tailscale.com/feature/condregister/oauthkey"
 	"tailscale.com/tsnet"
 
 	dockerpkg "mkmba.nz/tsserve/docker"
