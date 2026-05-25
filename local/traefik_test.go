@@ -50,7 +50,7 @@ func TestTraefikHandler_DisabledReturns404WithHint(t *testing.T) {
 	}
 }
 
-func TestTraefikHandler_StripsPrefixAndForwards(t *testing.T) {
+func TestTraefikHandler_KeepsPrefixAndForwards(t *testing.T) {
 	gotPath := make(chan string, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath <- r.URL.Path
@@ -75,8 +75,8 @@ func TestTraefikHandler_StripsPrefixAndForwards(t *testing.T) {
 	}
 	select {
 	case p := <-gotPath:
-		if p != "/api/version" {
-			t.Errorf("upstream path = %q, want /api/version", p)
+		if p != "/traefik/api/version" {
+			t.Errorf("upstream path = %q, want /traefik/api/version", p)
 		}
 	default:
 		t.Fatal("upstream not hit")

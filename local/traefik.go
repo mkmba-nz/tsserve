@@ -25,9 +25,10 @@ func ParseTraefikPort(s string) (int, error) {
 	return n, nil
 }
 
-// traefikHandler returns an http.Handler mounted at /traefik that strips the
-// prefix and forwards to http://localhost:<port>. When port is 0 the handler
-// returns a 404 with a one-line hint pointing at TSSERVE_TRAEFIK_PORT.
+// traefikHandler returns an http.Handler mounted at /traefik that forwards
+// to http://localhost:<port>. When port is 0 the handler returns a 404 with
+// a one-line hint pointing at TSSERVE_TRAEFIK_PORT. Note: for this handler
+// to work, traefik needs to be configured with api.basepath: /traefik/
 func traefikHandler(port int) http.Handler {
 	if port == 0 {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -39,5 +40,5 @@ func traefikHandler(port int) http.Handler {
 	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		http.Error(w, fmt.Sprintf("tsserve: traefik proxy error: %v\n", err), http.StatusBadGateway)
 	}
-	return http.StripPrefix("/traefik", rp)
+	return rp
 }
