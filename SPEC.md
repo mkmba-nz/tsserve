@@ -208,7 +208,9 @@ tsserve supports three authentication modes. The first matching mode wins, check
 | `TSSERVE_DISCOVERY` | No | `docker` | Discovery backend. `docker` reads `/var/run/docker.sock`. `ecs` queries the AWS ECS API. See [ECS Cluster Mode](#ecs-cluster-mode). |
 | `TSSERVE_ECS_CLUSTER` | ✱✱✱ | — | ECS cluster name or ARN to watch. Required when `TSSERVE_DISCOVERY=ecs`. |
 | `TSSERVE_ECS_POLL_INTERVAL` | No | `10s` | How often to poll the ECS API for task changes. Go duration format. |
-| `AWS_REGION` | ✱✱✱ | — | Standard AWS env var. Required when `TSSERVE_DISCOVERY=ecs` if not derivable from instance metadata or IAM role. |
+| `TSSERVE_ECS_AWS_PROFILE` | No | — | Shared-config profile to use **only** for the ECS discovery client. Set this instead of `AWS_PROFILE` so tsnet's WIF flow still resolves to the default (instance-role) identity Tailscale trusts. |
+| `TSSERVE_ECS_AWS_CONFIG_FILE` | No | — | Shared-config file path for the ECS discovery client only. Set this instead of `AWS_CONFIG_FILE` to keep the WIF credential chain clean. |
+| `AWS_REGION` | ✱✱✱ | — | Standard AWS env var. Required when `TSSERVE_DISCOVERY=ecs` if not derivable from instance metadata or IAM role. Safe to set process-wide — it does not affect identity. |
 | **Observability** | | | |
 | `TSSERVE_METRICS_ADDR` | No | `127.0.0.1:9090` | `host:port` for the loopback Prometheus listener that serves `/metrics`. Set to `""` to disable, or `0.0.0.0:9100` to expose to a remote scraper (the operator owns host-firewall enforcement in that case). |
 | `TSSERVE_TRAEFIK_PORT` | No | — | If set, the tailnet HTTPS listener proxies `/traefik` to `http://localhost:<port>`. Intended for reaching a co-located Traefik dashboard. Omit to disable. |
@@ -479,7 +481,7 @@ Queries the AWS ECS API on a fixed interval and drives the same `Registrar` inte
 - Pass discovered service definitions to the Service Manager.
 
 **Implementation notes:**
-- Use the AWS SDK for Go v2 (`github.com/aws/aws-sdk-go-v2/service/ecs` and `.../service/ec2`). Standard SDK config resolution (env, shared config, EC2 IMDS, ECS task role) handles credentials.
+- Use the AWS SDK for Go v2 (`github.com/aws/aws-sdk-go-v2/service/ecs` and `.../service/ec2`). Standard SDK config resolution (env, shared config, EC2 IMDS, ECS task role) handles credentials. The ECS client's config is loaded with `TSSERVE_ECS_AWS_PROFILE` / `TSSERVE_ECS_AWS_CONFIG_FILE` if set, rather than the process-wide `AWS_PROFILE` / `AWS_CONFIG_FILE`, so tsnet's WIF flow (which also calls `LoadDefaultConfig`) is not pulled onto a cross-account assumed role.
 - Use task ARN (not container ID) as the registration key, since ECS has no container-ID equivalent for the lifetime of a task.
 - Cache `DescribeTaskDefinition` results indefinitely by ARN (task defs are immutable per revision).
 - Cache container-instance → EC2 instance ID → private IP mappings; refresh on miss.
