@@ -12,16 +12,35 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
+// fakeConn is a minimal net.Conn whose Read drains a fixed payload once and
+// whose Write discards, used to drive countingConn byte accounting in tests.
+type fakeConn struct {
+	net.Conn
+	toRead []byte
+}
+
+func (f *fakeConn) Read(b []byte) (int, error) {
+	if len(f.toRead) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(b, f.toRead)
+	f.toRead = f.toRead[n:]
+	return n, nil
+}
+
+func (f *fakeConn) Write(b []byte) (int, error) { return len(b), nil }
+
 // hijackableRecorder is an httptest.ResponseRecorder that also implements
 // http.Hijacker, standing in for the real net/http server connection.
 type hijackableRecorder struct {
 	*httptest.ResponseRecorder
 	hijacked bool
+	conn     net.Conn
 }
 
 func (h *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	h.hijacked = true
-	return nil, nil, nil
+	return h.conn, nil, nil
 }
 
 // TestMiddleware_PreservesHijacker guards against the reverse proxy failing
@@ -40,7 +59,7 @@ func TestMiddleware_PreservesHijacker(t *testing.T) {
 		}
 	}))
 
-	rec := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
+	rec := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder(), conn: &fakeConn{}}
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 
 	if !sawHijacker {
@@ -48,6 +67,47 @@ func TestMiddleware_PreservesHijacker(t *testing.T) {
 	}
 	if !rec.hijacked {
 		t.Fatal("Hijack was not forwarded to the underlying ResponseWriter")
+	}
+}
+
+// TestMiddleware_HijackRecordsUpgradeNotLatency verifies that a hijacked
+// (WebSocket-style) request is recorded as a 101, that no request-duration
+// sample is emitted (which would pollute the latency histogram with the whole
+// connection lifetime), and that bytes flowing over the hijacked conn are
+// still accounted for in both directions.
+func TestMiddleware_HijackRecordsUpgradeNotLatency(t *testing.T) {
+	c := New()
+
+	h := c.Middleware("svc:ws", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Fatalf("Hijack: %v", err)
+		}
+		// Drain the client (request bytes) and write back (response bytes).
+		_, _ = io.Copy(io.Discard, conn)
+		_, _ = conn.Write([]byte("response-frame"))
+	}))
+
+	rec := &hijackableRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		conn:             &fakeConn{toRead: []byte("client-frame")},
+	}
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if got := testutil.ToFloat64(c.Requests.WithLabelValues("svc:ws", "GET", "101")); got != 1 {
+		t.Errorf("expected one 101 request, got %v", got)
+	}
+	if got := testutil.CollectAndCount(c.Duration); got != 0 {
+		t.Errorf("duration histogram should have no samples for a hijacked conn, got %d", got)
+	}
+	if got := testutil.ToFloat64(c.ReqBytes.WithLabelValues("svc:ws")); got != float64(len("client-frame")) {
+		t.Errorf("request bytes = %v, want %d", got, len("client-frame"))
+	}
+	if got := testutil.ToFloat64(c.RespBytes.WithLabelValues("svc:ws")); got != float64(len("response-frame")) {
+		t.Errorf("response bytes = %v, want %d", got, len("response-frame"))
+	}
+	if got := testutil.ToFloat64(c.InFlight.WithLabelValues("svc:ws")); got != 0 {
+		t.Errorf("in-flight gauge = %v, want 0 after the connection closes", got)
 	}
 }
 

@@ -105,10 +105,16 @@ func (c *Collector) Middleware(service string, next http.Handler) http.Handler {
 		if r.Body != nil && r.Body != http.NoBody {
 			r.Body = &countingReadCloser{ReadCloser: r.Body, n: reqB}
 		}
-		cw := &countingWriter{ResponseWriter: w, status: http.StatusOK, bytes: respB}
+		cw := &countingWriter{ResponseWriter: w, status: http.StatusOK, bytes: respB, reqBytes: reqB}
 		next.ServeHTTP(cw, r)
 
-		dur.WithLabelValues(service, r.Method).Observe(time.Since(start).Seconds())
+		// Hijacked connections (e.g. WebSocket upgrades) block in ServeHTTP for
+		// the entire connection lifetime, so their elapsed time is the session
+		// duration, not a request latency — recording it would pollute the
+		// histogram. Skip it; the request is still counted, with status 101.
+		if !cw.hijacked {
+			dur.WithLabelValues(service, r.Method).Observe(time.Since(start).Seconds())
+		}
 		reqs.WithLabelValues(service, r.Method, strconv.Itoa(cw.status)).Inc()
 	})
 }
@@ -117,7 +123,9 @@ type countingWriter struct {
 	http.ResponseWriter
 	status      int
 	wroteHeader bool
-	bytes       prometheus.Counter
+	hijacked    bool
+	bytes       prometheus.Counter // response bytes
+	reqBytes    prometheus.Counter // request bytes (used after a hijack)
 }
 
 func (w *countingWriter) WriteHeader(code int) {
@@ -158,7 +166,42 @@ func (w *countingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if !ok {
 		return nil, nil, fmt.Errorf("metrics: underlying ResponseWriter %T does not implement http.Hijacker", w.ResponseWriter)
 	}
-	return hj.Hijack()
+	conn, brw, err := hj.Hijack()
+	if err != nil {
+		return conn, brw, err
+	}
+	// The connection is now spliced past this writer: the proxy writes the 101
+	// directly to the raw conn, and all payload bytes flow over it rather than
+	// through Write/WriteHeader. Record the upgrade status here, and wrap the
+	// conn so post-handshake bytes (client reads = request, writes = response)
+	// are still accounted for.
+	w.hijacked = true
+	w.status = http.StatusSwitchingProtocols
+	return &countingConn{Conn: conn, read: w.reqBytes, written: w.bytes}, brw, nil
+}
+
+// countingConn accounts for bytes flowing over a hijacked connection: reads
+// from the client are request bytes, writes to the client are response bytes.
+type countingConn struct {
+	net.Conn
+	read    prometheus.Counter
+	written prometheus.Counter
+}
+
+func (c *countingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 && c.read != nil {
+		c.read.Add(float64(n))
+	}
+	return n, err
+}
+
+func (c *countingConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if n > 0 && c.written != nil {
+		c.written.Add(float64(n))
+	}
+	return n, err
 }
 
 type countingReadCloser struct {
