@@ -1,7 +1,9 @@
 package metrics
 
 import (
+	"bufio"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +11,45 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+// hijackableRecorder is an httptest.ResponseRecorder that also implements
+// http.Hijacker, standing in for the real net/http server connection.
+type hijackableRecorder struct {
+	*httptest.ResponseRecorder
+	hijacked bool
+}
+
+func (h *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h.hijacked = true
+	return nil, nil, nil
+}
+
+// TestMiddleware_PreservesHijacker guards against the reverse proxy failing
+// WebSocket/upgrade requests with "can't switch protocols using non-Hijacker
+// ResponseWriter": the countingWriter must forward Hijack to the underlying
+// writer when it supports it.
+func TestMiddleware_PreservesHijacker(t *testing.T) {
+	c := New()
+
+	var sawHijacker bool
+	h := c.Middleware("svc:ws", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		sawHijacker = ok
+		if ok {
+			_, _, _ = hj.Hijack()
+		}
+	}))
+
+	rec := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if !sawHijacker {
+		t.Fatal("countingWriter does not implement http.Hijacker")
+	}
+	if !rec.hijacked {
+		t.Fatal("Hijack was not forwarded to the underlying ResponseWriter")
+	}
+}
 
 func TestMiddleware_RecordsRequestAndDuration(t *testing.T) {
 	c := New()
