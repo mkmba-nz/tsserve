@@ -29,6 +29,7 @@ type Collector struct {
 	ReqBytes  *prometheus.CounterVec
 	RespBytes *prometheus.CounterVec
 	InFlight  *prometheus.GaugeVec
+	WSOpen    *prometheus.GaugeVec
 	Errors    *prometheus.CounterVec
 	Active    prometheus.Gauge
 }
@@ -61,6 +62,10 @@ func New() *Collector {
 			Name: "tsserve_proxy_in_flight_requests",
 			Help: "Current in-flight proxied HTTP requests, by service.",
 		}, []string{"service"}),
+		WSOpen: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tsserve_proxy_open_websockets",
+			Help: "Current open WebSocket (hijacked protocol-upgrade) connections, by service.",
+		}, []string{"service"}),
 		Errors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tsserve_proxy_backend_errors_total",
 			Help: "Backend errors reported by the reverse proxy, by service and reason.",
@@ -73,7 +78,7 @@ func New() *Collector {
 
 	reg.MustRegister(
 		c.Requests, c.Duration, c.ReqBytes, c.RespBytes,
-		c.InFlight, c.Errors, c.Active,
+		c.InFlight, c.WSOpen, c.Errors, c.Active,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		buildInfo(),
@@ -96,6 +101,7 @@ func (c *Collector) Middleware(service string, next http.Handler) http.Handler {
 	reqB := c.ReqBytes.WithLabelValues(service)
 	respB := c.RespBytes.WithLabelValues(service)
 	inflight := c.InFlight.WithLabelValues(service)
+	wsOpen := c.WSOpen.WithLabelValues(service)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		inflight.Inc()
@@ -105,7 +111,15 @@ func (c *Collector) Middleware(service string, next http.Handler) http.Handler {
 		if r.Body != nil && r.Body != http.NoBody {
 			r.Body = &countingReadCloser{ReadCloser: r.Body, n: reqB}
 		}
-		cw := &countingWriter{ResponseWriter: w, status: http.StatusOK, bytes: respB, reqBytes: reqB}
+		cw := &countingWriter{ResponseWriter: w, status: http.StatusOK, bytes: respB, reqBytes: reqB, wsOpen: wsOpen}
+		// The proxy blocks in ServeHTTP for the whole hijacked-connection
+		// lifetime, so a hijack that incremented wsOpen is balanced here once
+		// ServeHTTP returns — even if it unwinds via panic.
+		defer func() {
+			if cw.hijacked {
+				wsOpen.Dec()
+			}
+		}()
 		next.ServeHTTP(cw, r)
 
 		// Hijacked connections (e.g. WebSocket upgrades) block in ServeHTTP for
@@ -126,6 +140,7 @@ type countingWriter struct {
 	hijacked    bool
 	bytes       prometheus.Counter // response bytes
 	reqBytes    prometheus.Counter // request bytes (used after a hijack)
+	wsOpen      prometheus.Gauge   // open-WebSocket gauge, incremented on hijack
 }
 
 func (w *countingWriter) WriteHeader(code int) {
@@ -177,6 +192,9 @@ func (w *countingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	// are still accounted for.
 	w.hijacked = true
 	w.status = http.StatusSwitchingProtocols
+	if w.wsOpen != nil {
+		w.wsOpen.Inc()
+	}
 	return &countingConn{Conn: conn, read: w.reqBytes, written: w.bytes}, brw, nil
 }
 

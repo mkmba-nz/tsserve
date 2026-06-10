@@ -621,11 +621,12 @@ All counters and gauges are prefixed `tsserve_`. Histograms use the default Prom
 
 | Metric | Type | Labels | Notes |
 |---|---|---|---|
-| `tsserve_proxy_requests_total` | Counter | `service`, `method`, `code` | One increment per proxied HTTP request (the wrapped response status is the `code`, so backend 502s show up here). |
-| `tsserve_proxy_request_duration_seconds` | Histogram | `service`, `method` | Wall-clock time from handler entry to exit. |
-| `tsserve_proxy_request_bytes_total` | Counter | `service` | Bytes read from request bodies. |
-| `tsserve_proxy_response_bytes_total` | Counter | `service` | Bytes written to response bodies (does not include response headers). |
-| `tsserve_proxy_in_flight_requests` | Gauge | `service` | Currently executing handlers, by service. |
+| `tsserve_proxy_requests_total` | Counter | `service`, `method`, `code` | One increment per proxied HTTP request (the wrapped response status is the `code`, so backend 502s show up here). Hijacked protocol upgrades (WebSocket) are recorded as `101`. |
+| `tsserve_proxy_request_duration_seconds` | Histogram | `service`, `method` | Wall-clock time from handler entry to exit. Hijacked (WebSocket) connections are excluded, since their lifetime is a session, not a request latency. |
+| `tsserve_proxy_request_bytes_total` | Counter | `service` | Bytes read from request bodies. After a hijack, also counts bytes read from the client over the upgraded connection. |
+| `tsserve_proxy_response_bytes_total` | Counter | `service` | Bytes written to response bodies (does not include response headers). After a hijack, also counts bytes written to the client over the upgraded connection. |
+| `tsserve_proxy_in_flight_requests` | Gauge | `service` | Currently executing handlers, by service. Includes open WebSocket connections (they block in the handler for their lifetime). |
+| `tsserve_proxy_open_websockets` | Gauge | `service` | Current open WebSocket (hijacked protocol-upgrade) connections, by service. |
 | `tsserve_proxy_backend_errors_total` | Counter | `service`, `reason` | Backend errors observed by the reverse proxy's `ErrorHandler`. `reason` is a coarse classification: `timeout`, `connection-refused`, `dns`, `eof`, `other`. |
 | `tsserve_services_active` | Gauge | — | Number of Tailscale Services currently registered. |
 | `tsserve_build_info` | Gauge | `version`, `revision`, `go_version` (const) | Constant `1`. Useful for grouping in dashboards. |
