@@ -5,7 +5,10 @@
 package metrics
 
 import (
+	"bufio"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"runtime"
 	"runtime/debug"
@@ -143,6 +146,19 @@ func (w *countingWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack forwards to the underlying ResponseWriter when supported so that
+// protocol upgrades (e.g. WebSocket 101 Switching Protocols) handled by the
+// reverse proxy can take over the connection. Without this, the embedded
+// ResponseWriter interface does not promote Hijack, and the proxy fails with
+// "can't switch protocols using non-Hijacker ResponseWriter".
+func (w *countingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("metrics: underlying ResponseWriter %T does not implement http.Hijacker", w.ResponseWriter)
+	}
+	return hj.Hijack()
 }
 
 type countingReadCloser struct {
