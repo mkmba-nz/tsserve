@@ -78,11 +78,14 @@ func TestMiddleware_PreservesHijacker(t *testing.T) {
 func TestMiddleware_HijackRecordsUpgradeNotLatency(t *testing.T) {
 	c := New()
 
+	var openDuringConn float64
 	h := c.Middleware("svc:ws", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, _, err := w.(http.Hijacker).Hijack()
 		if err != nil {
 			t.Fatalf("Hijack: %v", err)
 		}
+		// While the connection is live, the open-websocket gauge should read 1.
+		openDuringConn = testutil.ToFloat64(c.WSOpen.WithLabelValues("svc:ws"))
 		// Drain the client (request bytes) and write back (response bytes).
 		_, _ = io.Copy(io.Discard, conn)
 		_, _ = conn.Write([]byte("response-frame"))
@@ -108,6 +111,12 @@ func TestMiddleware_HijackRecordsUpgradeNotLatency(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(c.InFlight.WithLabelValues("svc:ws")); got != 0 {
 		t.Errorf("in-flight gauge = %v, want 0 after the connection closes", got)
+	}
+	if openDuringConn != 1 {
+		t.Errorf("open-websocket gauge during connection = %v, want 1", openDuringConn)
+	}
+	if got := testutil.ToFloat64(c.WSOpen.WithLabelValues("svc:ws")); got != 0 {
+		t.Errorf("open-websocket gauge = %v, want 0 after the connection closes", got)
 	}
 }
 
