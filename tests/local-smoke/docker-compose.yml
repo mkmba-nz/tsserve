@@ -1,0 +1,144 @@
+# tsserve Tier 2 smoke test stack.
+#
+# Brings up a tsserve built from the repo root plus three labelled backends:
+#   - svc:tsserve-test-web   nginx default page
+#   - svc:tsserve-test-echo  traefik/whoami — reflects headers (so we can verify
+#                            X-Forwarded-* and Tailscale-User-* headers arrive)
+#   - svc:tsserve-test-caps  traefik/whoami with tsserve.caps set — verifies the
+#                            Tailscale-App-Capabilities header AND the node
+#                            identity headers (Tailscale-Node-Tags/-Name).
+#
+# Required environment (set in tier2/.env or your shell):
+#   TS_AUTHKEY                tskey-auth-... tagged with tag:tsserve
+#
+# Optional:
+#   TSSERVE_HOSTNAME          defaults to tsserve-tier2 (used as the node's
+#                             tailnet hostname; the status page lives at
+#                             https://${TSSERVE_HOSTNAME}.${TAILNET}.ts.net/)
+#   TSSERVE_LOG_LEVEL         debug | info | warn | error (default info)
+#   TSSERVE_METRICS_ADDR      default 127.0.0.1:9090 (bind on the tsserve
+#                             container; exposed to the host as
+#                             ${HOST_METRICS_PORT:-9090}).
+#   TS_CLIENT_AUTHKEY         a SECOND, TAGGED auth key. When set, the script
+#                             starts a tagged Tailscale client (compose profile
+#                             "tagged-client") and uses it to verify that
+#                             Tailscale-Node-Tags/-Name are injected for tagged
+#                             peers. Leave unset to skip those checks.
+#   CLIENT_HOSTNAME           tagged client's hostname (default
+#                             tsserve-tier2-client); appears in Node-Name.
+#
+# Prerequisites in the Tailscale admin console:
+#   - HTTPS Certificates + MagicDNS enabled
+#   - Services `svc:tsserve-test-web`, `svc:tsserve-test-echo` and
+#     `svc:tsserve-test-caps` defined on TCP/443, OR an autoApprovers entry
+#     covering `svc:tsserve-test-*` for `tag:tsserve`
+#   - Grants allowing your user to reach those services
+#   - For the tagged-client checks: a grant allowing the client's tag to reach
+#     `svc:tsserve-test-caps`
+
+services:
+  tsserve:
+    build:
+      context: ..
+    image: tsserve:tier2-test
+    container_name: tsserve-tier2
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?TS_AUTHKEY must be set}
+      TSSERVE_HOSTNAME: ${TSSERVE_HOSTNAME:-tsserve-tier2}
+      TSSERVE_LOG_LEVEL: ${TSSERVE_LOG_LEVEL:-info}
+      TSSERVE_DISCOVERY: docker
+      # Bind metrics on 0.0.0.0 inside the container so we can expose to host.
+      TSSERVE_METRICS_ADDR: 0.0.0.0:9090
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - tsserve-tier2-state:/var/lib/tsserve
+    ports:
+      # Expose the metrics endpoint to the host for smoke-test scrape.
+      - "${HOST_METRICS_PORT:-9090}:9090"
+    restart: "no"
+
+  web:
+    image: nginx:alpine
+    container_name: tsserve-tier2-web
+    labels:
+      tsserve.enable: "true"
+      tsserve.service: "svc:tsserve-test-web"
+      tsserve.port: "80"
+      # Match the explicit network name below; otherwise the default ("bridge")
+      # wouldn't be attached to this container under docker compose.
+      tsserve.network: "tsserve-tier2"
+    restart: "no"
+
+  echo:
+    image: traefik/whoami:latest
+    container_name: tsserve-tier2-echo
+    labels:
+      tsserve.enable: "true"
+      tsserve.service: "svc:tsserve-test-echo"
+      tsserve.port: "80"
+      tsserve.network: "tsserve-tier2"
+      # whoami will print the Tailscale-User-* headers injected by serve.
+    restart: "no"
+
+  caps:
+    image: traefik/whoami:latest
+    container_name: tsserve-tier2-caps
+    labels:
+      tsserve.enable: "true"
+      tsserve.service: "svc:tsserve-test-caps"
+      tsserve.port: "80"
+      tsserve.network: "tsserve-tier2"
+      # Opt in to forwarding the named capability. Backend will see a
+      # Tailscale-App-Capabilities header with the JSON-encoded grant payload
+      # iff the connecting peer's ACL grants this capability for the service.
+      tsserve.caps: "tsserve.test/cap/read"
+    restart: "no"
+
+  # --- Tagged peer for node-identity header validation -----------------------
+  # When tsserve.caps is set on a service, tsserve resolves the connecting peer
+  # via whois and, for TAGGED nodes only, injects Tailscale-Node-Tags and
+  # Tailscale-Node-Name. The smoke-test host is usually a *user* node, so we add
+  # a genuinely tagged Tailscale client to drive that path.
+  #
+  # Only started when TS_CLIENT_AUTHKEY is set (compose profile "tagged-client").
+  # Runs tailscaled in userspace mode and exposes a SOCKS5 proxy on
+  # localhost:1055 inside its network namespace; the clienttools sidecar shares
+  # that namespace and curls the tailnet through it. The auth key MUST be tagged
+  # (e.g. tag:tsserve) and its tag must be granted access to
+  # svc:tsserve-test-caps in your ACLs.
+  client:
+    image: tailscale/tailscale:latest
+    container_name: tsserve-tier2-client
+    hostname: ${CLIENT_HOSTNAME:-tsserve-tier2-client}
+    profiles: ["tagged-client"]
+    environment:
+      TS_AUTHKEY: ${TS_CLIENT_AUTHKEY:-}
+      TS_USERSPACE: "true"
+      TS_SOCKS5_SERVER: "localhost:1055"
+      TS_EXTRA_ARGS: "--hostname=${CLIENT_HOSTNAME:-tsserve-tier2-client}"
+      TS_STATE_DIR: /var/lib/tailscale
+    volumes:
+      - tsserve-tier2-client-state:/var/lib/tailscale
+    restart: "no"
+
+  # curl-capable sidecar sharing the tagged client's network namespace, so it
+  # reaches the tailnet through the SOCKS5 proxy on localhost:1055.
+  clienttools:
+    image: curlimages/curl:latest
+    container_name: tsserve-tier2-clienttools
+    profiles: ["tagged-client"]
+    network_mode: "service:client"
+    entrypoint: ["tail", "-f", "/dev/null"]
+    depends_on:
+      - client
+    restart: "no"
+
+# Pin the compose-created default network to a stable name so the
+# tsserve.network labels above don't depend on the parent directory.
+networks:
+  default:
+    name: tsserve-tier2
+
+volumes:
+  tsserve-tier2-state:
+  tsserve-tier2-client-state:
