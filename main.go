@@ -83,7 +83,7 @@ func run() error {
 	}
 
 	mc := metrics.New()
-	mgr := proxy.NewManager(srv, logger, mc)
+	mgr := proxy.NewManager(srv, lc, logger, mc)
 	defer mgr.Close()
 
 	discoveryMode := strings.ToLower(envDefault("TSSERVE_DISCOVERY", "docker"))

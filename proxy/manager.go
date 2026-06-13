@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
 
 	"mkmba.nz/tsserve/metrics"
@@ -32,8 +33,12 @@ type Manager struct {
 	// (*tsnet.Server).ListenService; tests swap it for an in-memory listener
 	// factory.
 	listenSvc func(name string, mode tsnet.ServiceMode) (net.Listener, error)
-	logger    *slog.Logger
-	metrics   *metrics.Collector
+	// whois resolves a connecting peer's identity for node-header injection. In
+	// production this is (*local.Client).WhoIs; tests inject a stub. It may be
+	// nil, in which case no node headers are injected (they are still stripped).
+	whois   whoisFunc
+	logger  *slog.Logger
+	metrics *metrics.Collector
 
 	mu       sync.Mutex
 	byCID    map[string]*activeService // containerID -> service
@@ -74,9 +79,11 @@ type ServiceView struct {
 }
 
 // NewManager wraps a tsnet.Server that has already started successfully.
-// mc may be nil; when nil no metrics are recorded.
-func NewManager(srv *tsnet.Server, logger *slog.Logger, mc *metrics.Collector) *Manager {
-	return &Manager{
+// mc may be nil; when nil no metrics are recorded. lc is the tsnet LocalClient
+// used to resolve connecting peers for node-header injection; it may be nil, in
+// which case no node headers are injected.
+func NewManager(srv *tsnet.Server, lc *local.Client, logger *slog.Logger, mc *metrics.Collector) *Manager {
+	m := &Manager{
 		listenSvc: func(name string, mode tsnet.ServiceMode) (net.Listener, error) {
 			return srv.ListenService(name, mode)
 		},
@@ -85,6 +92,10 @@ func NewManager(srv *tsnet.Server, logger *slog.Logger, mc *metrics.Collector) *
 		byCID:   map[string]*activeService{},
 		byName:  map[string]string{},
 	}
+	if lc != nil {
+		m.whois = lc.WhoIs
+	}
+	return m
 }
 
 // ServiceDef mirrors docker.ServiceDef so the proxy package does not import
@@ -147,7 +158,11 @@ func (m *Manager) Register(containerID string, def *ServiceDef, backendIP string
 		}
 	}
 
-	var handler http.Handler = newReverseProxy(def.Scheme, backendIP, def.Port, m.logger, onError)
+	// Node-header injection rides on the same opt-in as app capabilities: when a
+	// service requests caps, tsserve also resolves the connecting peer and
+	// injects Tailscale-Node-Tags/Name for tagged nodes.
+	injectNode := len(def.Caps) > 0
+	var handler http.Handler = newReverseProxy(def.Scheme, backendIP, def.Port, m.logger, onError, injectNode, m.whois)
 	handler = m.metrics.Middleware(def.Service, handler)
 
 	httpSrv := &http.Server{Handler: handler}
