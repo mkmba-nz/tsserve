@@ -3,6 +3,7 @@ package certsync
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -23,6 +24,11 @@ type fakeS3 struct {
 	listErr error
 	getErr  error
 	putErr  error
+
+	// Per-key failures let tests exercise partial success: only the listed
+	// keys error, every other key behaves normally.
+	getErrKeys map[string]error
+	putErrKeys map[string]error
 }
 
 func newFakeS3() *fakeS3 { return &fakeS3{objects: map[string][]byte{}} }
@@ -49,6 +55,9 @@ func (f *fakeS3) GetObject(ctx context.Context, in *s3.GetObjectInput, opts ...f
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
+	if err := f.getErrKeys[aws.ToString(in.Key)]; err != nil {
+		return nil, err
+	}
 	body, ok := f.objects[aws.ToString(in.Key)]
 	if !ok {
 		return nil, &s3types.NoSuchKey{}
@@ -59,6 +68,9 @@ func (f *fakeS3) GetObject(ctx context.Context, in *s3.GetObjectInput, opts ...f
 func (f *fakeS3) PutObject(ctx context.Context, in *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
 	if f.putErr != nil {
 		return nil, f.putErr
+	}
+	if err := f.putErrKeys[aws.ToString(in.Key)]; err != nil {
+		return nil, err
 	}
 	data, err := io.ReadAll(in.Body)
 	if err != nil {
@@ -189,6 +201,10 @@ func TestRunFinalSweepOnCancel(t *testing.T) {
 	writeFile(t, dir, "web.ts.net.crt", "CRT")
 	writeFile(t, dir, "web.ts.net.key", "KEY")
 
+	if err := s.Watch(); err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
@@ -209,6 +225,90 @@ func TestRunFinalSweepOnCancel(t *testing.T) {
 		if _, ok := fake.objects[k]; !ok {
 			t.Errorf("expected %q uploaded on final sweep, got %v", k, fake.objects)
 		}
+	}
+}
+
+func TestHydratePartialFailureRestoresRest(t *testing.T) {
+	fake := newFakeS3()
+	fake.objects["certs/web.example.ts.net.crt"] = []byte("CRT")
+	fake.objects["certs/web.example.ts.net.key"] = []byte("KEY")
+	fake.objects["certs/acme-account.key.pem"] = []byte("ACME")
+	// One object fails to download; the others must still be restored and the
+	// failure must surface as a (non-fatal) returned error.
+	boom := errors.New("boom")
+	fake.getErrKeys = map[string]error{"certs/web.example.ts.net.key": boom}
+
+	s, dir := newSyncer(t, fake, "certs/")
+	err := s.Hydrate(context.Background())
+	if err == nil {
+		t.Fatal("Hydrate: expected error from failed object, got nil")
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("Hydrate error = %v, want it to wrap boom", err)
+	}
+	for name, body := range map[string]string{
+		"web.example.ts.net.crt": "CRT",
+		"acme-account.key.pem":   "ACME",
+	} {
+		b, rerr := os.ReadFile(filepath.Join(dir, name))
+		if rerr != nil {
+			t.Errorf("read %s: %v", name, rerr)
+			continue
+		}
+		if string(b) != body {
+			t.Errorf("%s = %q, want %q", name, b, body)
+		}
+	}
+	// The failed object was not written.
+	if _, rerr := os.Stat(filepath.Join(dir, "web.example.ts.net.key")); !os.IsNotExist(rerr) {
+		t.Errorf("expected failed object absent, stat err = %v", rerr)
+	}
+}
+
+func TestSyncAllPartialFailureUploadsRest(t *testing.T) {
+	fake := newFakeS3()
+	s, dir := newSyncer(t, fake, "certs/")
+	writeFile(t, dir, "web.ts.net.crt", "CRT")
+	writeFile(t, dir, "web.ts.net.key", "KEY")
+	writeFile(t, dir, "acme-account.key.pem", "ACME")
+
+	// One upload fails; the others must still be uploaded and the failure must
+	// surface so the caller can log it.
+	boom := errors.New("boom")
+	fake.putErrKeys = map[string]error{"certs/web.ts.net.key": boom}
+
+	err := s.syncAll(context.Background())
+	if err == nil {
+		t.Fatal("syncAll: expected error from failed upload, got nil")
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("syncAll error = %v, want it to wrap boom", err)
+	}
+	for _, k := range []string{"certs/web.ts.net.crt", "certs/acme-account.key.pem"} {
+		if _, ok := fake.objects[k]; !ok {
+			t.Errorf("expected %q uploaded despite the failure, got %v", k, fake.objects)
+		}
+	}
+	if _, ok := fake.objects["certs/web.ts.net.key"]; ok {
+		t.Error("failed upload should be absent from the bucket")
+	}
+}
+
+func TestRunBeforeWatchErrors(t *testing.T) {
+	s, _ := newSyncer(t, newFakeS3(), "certs/")
+	if err := s.Run(context.Background()); err == nil {
+		t.Fatal("Run before Watch: expected error, got nil")
+	}
+}
+
+func TestWatchTwiceErrors(t *testing.T) {
+	s, _ := newSyncer(t, newFakeS3(), "certs/")
+	if err := s.Watch(); err != nil {
+		t.Fatalf("first Watch: %v", err)
+	}
+	defer s.watcher.Close()
+	if err := s.Watch(); err == nil {
+		t.Error("second Watch: expected error, got nil")
 	}
 }
 
