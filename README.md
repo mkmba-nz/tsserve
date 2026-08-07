@@ -69,7 +69,13 @@ Authentication (one of):
 General:
 
 - `TSSERVE_HOSTNAME` (default `tsserve`)
-- `TSSERVE_STATE_DIR` (default `/var/lib/tsserve`)
+- `TSSERVE_STATE_DIR` (default `/var/lib/tsserve`) — tsnet's var root; holds the
+  cert directory and (by default) the node identity file.
+- `TSSERVE_STATE_STORE` — move node identity (machine/node key) off local disk
+  into an external store, e.g. an AWS SSM parameter ARN
+  `arn:aws:ssm:<region>:<acct>:parameter/<name>`. `TSSERVE_STATE_DIR` is still
+  used for certs. Requires `ssm:GetParameter`, `ssm:PutParameter`. Combine with
+  `TSSERVE_CERT_S3_BUCKET` for durable identity + certs on ephemeral hosts.
 - `TSSERVE_LOG_LEVEL` (`debug` | `info` | `warn` | `error`)
 
 Certificate cache (optional; for ephemeral filesystems like ECS/Fargate):
