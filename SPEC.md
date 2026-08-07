@@ -227,6 +227,10 @@ tsserve supports three authentication modes. The first matching mode wins, check
 | `TSSERVE_ECS_AWS_PROFILE` | No | — | Shared-config profile to use **only** for the ECS discovery client. Set this instead of `AWS_PROFILE` so tsnet's WIF flow still resolves to the default (instance-role) identity Tailscale trusts. In multi-account mode it is the shared default profile. |
 | `TSSERVE_ECS_AWS_CONFIG_FILE` | No | — | Shared-config file path for the ECS discovery client only. Set this instead of `AWS_CONFIG_FILE` to keep the WIF credential chain clean. In multi-account mode it is the shared default config file. |
 | `AWS_REGION` | ✱✱✱ | — | Standard AWS env var. Required when `TSSERVE_DISCOVERY=ecs` if not derivable from instance metadata or IAM role. Safe to set process-wide — it does not affect identity. In multi-account mode it is the shared default region. |
+| **Certificate cache** | | | |
+| `TSSERVE_CERT_S3_BUCKET` | No | — | Enables the S3-backed TLS certificate cache. When set, tsnet's on-disk cert cache (`<TSSERVE_STATE_DIR>/certs`) is restored from this bucket at startup and any cert tsnet provisions or renews is uploaded back. Intended for ephemeral filesystems (ECS/Fargate) so restarts reuse existing Let's Encrypt certs instead of re-running ACME. Unset ⇒ certs stay on local disk only, as before. See [TLS certificate cache](#tls-certificate-cache). |
+| `TSSERVE_CERT_S3_PREFIX` | No | — | Optional key prefix within the bucket (e.g. `tsserve/prod/`). Lets one bucket back multiple nodes. |
+| `TSSERVE_CERT_S3_REGION` | No | `AWS_REGION` | Region for the cert-cache S3 client. Defaults to `AWS_REGION`. The cache client loads its own AWS config, so this does not affect tsnet's credential resolution. |
 | **Observability** | | | |
 | `TSSERVE_METRICS_ADDR` | No | `127.0.0.1:9090` | `host:port` for the loopback Prometheus listener that serves `/metrics`. Set to `""` to disable, or `0.0.0.0:9100` to expose to a remote scraper (the operator owns host-firewall enforcement in that case). |
 | `TSSERVE_TRAEFIK_PORT` | No | — | If set, the tailnet HTTPS listener proxies `/traefik` to `http://localhost:<port>`. Intended for reaching a co-located Traefik dashboard. Omit to disable. |
@@ -646,6 +650,59 @@ When a container restarts, Docker emits `die` then `start`. The stop handler tea
 | `ec2:DescribeInstances` fails for a container instance (ECS mode) | Log warning. Skip this container. Cached host IPs are invalidated on failure so the next poll retries cleanly. |
 | `tsnet.Server.Start()` fails (e.g. bad auth key, OIDC token exchange failure, expired credentials) | Fatal error. Exit with message. For OIDC failures, suggest checking the federated identity configuration in the Tailscale admin console. |
 | Duplicate `tsserve.service` on two containers (Docker mode) or two tasks (ECS mode) | First one wins. Log a warning for the duplicate. If the first stops, the second does NOT auto-register (it would need to be restarted, or ECS mode would need to rediscover it on the next poll cycle). |
+
+---
+
+## TLS certificate cache
+
+tsnet provisions TLS certificates for each served FQDN from Let's Encrypt (via
+Tailscale's ACME flow) and caches them as files under `<TSSERVE_STATE_DIR>/certs`
+— one `<domain>.crt` and `<domain>.key` per service, plus a shared
+`acme-account.key.pem`. On an ephemeral filesystem (ECS/Fargate) that directory
+is discarded on every restart, so each fresh task re-runs the ACME flow and can
+hit Let's Encrypt [rate limits](https://letsencrypt.org/docs/rate-limits/).
+
+Setting `TSSERVE_CERT_S3_BUCKET` turns that directory into a cache backed by S3:
+
+- **Restore on startup.** Before `tsnet.Server.Start()`, the cert objects under
+  `TSSERVE_CERT_S3_PREFIX` are downloaded into `<TSSERVE_STATE_DIR>/certs`. A
+  restored certificate is bound to the FQDN, not the node identity, so it stays
+  valid even though a fresh task registers a new node key. An empty or missing
+  bucket is not an error — there is simply nothing to restore.
+- **Upload on change.** A filesystem watch on the certs directory uploads any
+  cert tsnet writes (issuance or renewal) within a couple of seconds, and a
+  final sweep runs on graceful shutdown (`SIGTERM`/`SIGINT`) so a cert issued
+  just before a task is replaced still reaches the bucket.
+
+Scope and limits, by design:
+
+- **Certs only.** Only `*.crt`, `*.key`, and `acme-account.key.pem` are
+  mirrored. Node identity (`tailscaled.state`) is **not** synced — a restarted
+  task re-registers as a new node. This keeps the node's private key off S3;
+  the tradeoff is that node identity is not preserved across restarts.
+- **Overwrite-only.** A renewal reuses the same object key; nothing is ever
+  deleted from the bucket. Prune stale objects out of band if needed.
+- **One prefix per node.** Use `TSSERVE_CERT_S3_PREFIX` to share one bucket
+  across multiple nodes without collisions.
+
+The cache's S3 client loads its own AWS config (region from
+`TSSERVE_CERT_S3_REGION`, else `AWS_REGION`), deliberately separate from tsnet's
+credential resolution so it never perturbs the workload-identity flow — the same
+isolation the ECS discovery client uses.
+
+### IAM permissions
+
+The host's IAM role must permit, scoped to the bucket (and prefix) in use:
+
+| Action | Purpose |
+|---|---|
+| `s3:ListBucket` | Enumerate cert objects under the prefix at startup (restore). |
+| `s3:GetObject` | Download each cert object into the local cache. |
+| `s3:PutObject` | Upload certs on issuance, renewal, and shutdown. |
+
+`s3:ListBucket` is granted on the bucket ARN; `s3:GetObject`/`s3:PutObject` on
+the object ARN (e.g. `arn:aws:s3:::my-bucket/tsserve/prod/*`). No delete
+permission is required.
 
 ---
 

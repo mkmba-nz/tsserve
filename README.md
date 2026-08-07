@@ -72,6 +72,17 @@ General:
 - `TSSERVE_STATE_DIR` (default `/var/lib/tsserve`)
 - `TSSERVE_LOG_LEVEL` (`debug` | `info` | `warn` | `error`)
 
+Certificate cache (optional; for ephemeral filesystems like ECS/Fargate):
+
+- `TSSERVE_CERT_S3_BUCKET` — back tsnet's TLS cert cache with S3. Certs are
+  restored from the bucket at startup and re-uploaded on issuance, renewal, and
+  shutdown, so restarts reuse existing Let's Encrypt certs instead of re-running
+  ACME. Unset ⇒ certs stay on local disk only. Only certificates are synced, not
+  node identity. Requires `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`.
+- `TSSERVE_CERT_S3_PREFIX` — optional key prefix, to share one bucket across
+  nodes.
+- `TSSERVE_CERT_S3_REGION` (default `AWS_REGION`) — region for the cache client.
+
 Observability:
 
 - `TSSERVE_METRICS_ADDR` (default `127.0.0.1:9090`) — loopback HTTP listener
