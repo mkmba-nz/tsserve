@@ -221,11 +221,12 @@ tsserve supports three authentication modes. The first matching mode wins, check
 | `TSSERVE_LOG_LEVEL` | No | `info` | Log level: `debug`, `info`, `warn`, `error`. |
 | **Discovery** | | | |
 | `TSSERVE_DISCOVERY` | No | `docker` | Discovery backend. `docker` reads `/var/run/docker.sock`. `ecs` queries the AWS ECS API. See [ECS Cluster Mode](#ecs-cluster-mode). |
-| `TSSERVE_ECS_CLUSTER` | ✱✱✱ | — | ECS cluster name or ARN to watch. Required when `TSSERVE_DISCOVERY=ecs`. |
-| `TSSERVE_ECS_POLL_INTERVAL` | No | `10s` | How often to poll the ECS API for task changes. Go duration format. |
-| `TSSERVE_ECS_AWS_PROFILE` | No | — | Shared-config profile to use **only** for the ECS discovery client. Set this instead of `AWS_PROFILE` so tsnet's WIF flow still resolves to the default (instance-role) identity Tailscale trusts. |
-| `TSSERVE_ECS_AWS_CONFIG_FILE` | No | — | Shared-config file path for the ECS discovery client only. Set this instead of `AWS_CONFIG_FILE` to keep the WIF credential chain clean. |
-| `AWS_REGION` | ✱✱✱ | — | Standard AWS env var. Required when `TSSERVE_DISCOVERY=ecs` if not derivable from instance metadata or IAM role. Safe to set process-wide — it does not affect identity. |
+| `TSSERVE_ECS_CLUSTER` | ✱✱✱ | — | ECS cluster name or ARN to watch. Required when `TSSERVE_DISCOVERY=ecs`, unless every entry in `TSSERVE_ECS_ACCOUNTS` supplies its own `cluster`. In multi-account mode it is the shared default cluster. |
+| `TSSERVE_ECS_ACCOUNTS` | No | — | JSON array of accounts to discover, one poller per entry, each with its own credential context. Unset ⇒ single-account mode using the vars below. See [Multiple AWS accounts](#multiple-aws-accounts). |
+| `TSSERVE_ECS_POLL_INTERVAL` | No | `10s` | How often to poll the ECS API for task changes. Go duration format. Applies to every account. |
+| `TSSERVE_ECS_AWS_PROFILE` | No | — | Shared-config profile to use **only** for the ECS discovery client. Set this instead of `AWS_PROFILE` so tsnet's WIF flow still resolves to the default (instance-role) identity Tailscale trusts. In multi-account mode it is the shared default profile. |
+| `TSSERVE_ECS_AWS_CONFIG_FILE` | No | — | Shared-config file path for the ECS discovery client only. Set this instead of `AWS_CONFIG_FILE` to keep the WIF credential chain clean. In multi-account mode it is the shared default config file. |
+| `AWS_REGION` | ✱✱✱ | — | Standard AWS env var. Required when `TSSERVE_DISCOVERY=ecs` if not derivable from instance metadata or IAM role. Safe to set process-wide — it does not affect identity. In multi-account mode it is the shared default region. |
 | **Observability** | | | |
 | `TSSERVE_METRICS_ADDR` | No | `127.0.0.1:9090` | `host:port` for the loopback Prometheus listener that serves `/metrics`. Set to `""` to disable, or `0.0.0.0:9100` to expose to a remote scraper (the operator owns host-firewall enforcement in that case). |
 | `TSSERVE_TRAEFIK_PORT` | No | — | If set, the tailnet HTTPS listener proxies `/traefik` to `http://localhost:<port>`. Intended for reaching a co-located Traefik dashboard. Omit to disable. |
@@ -352,6 +353,48 @@ The proxy host's IAM role (or AWS credentials supplied via the standard SDK env 
 For deployments running awsvpc tasks exclusively, the last two actions can be omitted.
 
 Scope the IAM policy to the specific cluster ARN where possible; `ecs:Describe*` actions accept resource ARN conditions.
+
+### Multiple AWS accounts
+
+A single credential context authenticates with one set of AWS credentials and therefore
+discovers tasks in one account. To discover tasks across several accounts, set
+`TSSERVE_ECS_ACCOUNTS` to a JSON array: tsserve builds one independent poller per entry,
+each with its own credential context, and reconciles them all against the same set of
+Tailscale Services.
+
+Registration keys are the task ARN plus the container name, and task ARNs embed the account,
+region, and cluster, so pollers never collide even when two accounts run identically-named
+tasks. The single-account (`TSSERVE_ECS_ACCOUNTS` unset) path is unchanged.
+
+Each array entry accepts these optional fields; a blank field inherits the shared default
+from the single-account env vars:
+
+| Field | Inherits from | Purpose |
+|---|---|---|
+| `name` | AWS account ID (resolved via `sts:GetCallerIdentity`) | Identity label in logs / startup summary. Must be unique across accounts; set it explicitly when two entries resolve to the same account ID (e.g. one account in two regions). |
+| `cluster` | `TSSERVE_ECS_CLUSTER` | Cluster this poller watches. |
+| `region` | `AWS_REGION` | AWS region for this account's clients. |
+| `profile` | `TSSERVE_ECS_AWS_PROFILE` | AWS shared-config profile. |
+| `configFile` | `TSSERVE_ECS_AWS_CONFIG_FILE` | AWS shared-config file path. |
+| `accessKeyID` + `secretAccessKey` | — | Static credentials (set both or neither). |
+
+A typical border-gateway setup grants the host an IAM reader role in each target account and
+exposes one shared-config profile per account (named by account ID), letting tsserve resolve
+the identities itself:
+
+```jsonc
+// TSSERVE_ECS_ACCOUNTS (single line in the systemd EnvironmentFile)
+[
+  {"profile": "ecs-reader-111", "cluster": "infra"},
+  {"profile": "ecs-reader-222", "cluster": "ocopt-front", "region": "ap-southeast-2"}
+]
+```
+
+Each account exposes the [IAM permissions](#iam-permissions) above through the role its
+profile assumes; when `name` is omitted, that role must additionally allow
+`sts:GetCallerIdentity` so tsserve can derive the account ID. As in single-account mode, these
+profiles are scoped to the ECS clients only — tsnet's WIF auth flow keeps using the host's
+default (instance-role) identity, never a cross-account reader role.
 
 ### Where labels live
 
