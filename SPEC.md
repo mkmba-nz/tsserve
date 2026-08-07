@@ -217,7 +217,8 @@ tsserve supports three authentication modes. The first matching mode wins, check
 | `TSSERVE_TAGS` | ✱✱ | — | Comma-separated ACL tags to advertise (e.g. `tag:tsserve`). **Required** for OAuth and OIDC auth. Maps to `tsnet.Server.AdvertiseTags`. Not needed if using `TS_AUTHKEY` with a pre-tagged key. |
 | **General** | | | |
 | `TSSERVE_HOSTNAME` | No | `tsserve` | The hostname for the tsnet node on the tailnet. |
-| `TSSERVE_STATE_DIR` | No | `/var/lib/tsserve` | Directory for tsnet state persistence across restarts. |
+| `TSSERVE_STATE_DIR` | No | `/var/lib/tsserve` | Directory for tsnet state persistence across restarts. Always used as tsnet's var root — the TLS cert directory (`<dir>/certs`) and log config live here even when `TSSERVE_STATE_STORE` is set. |
+| `TSSERVE_STATE_STORE` | No | — | Diverts **only** the node identity (`tailscaled.state`: machine/node key and prefs) to an external state store, leaving certs on disk under `TSSERVE_STATE_DIR`. Value is a `store.New` target — most usefully an AWS SSM parameter ARN, `arn:aws:ssm:<region>:<acct>:parameter/<name>[?kmsKey=<id>]`. Unset ⇒ identity is a `tailscaled.state` file under `TSSERVE_STATE_DIR`, as before. Pairs with `TSSERVE_CERT_S3_BUCKET` for a fully durable identity+certs setup on ephemeral filesystems. See [Node state store](#node-state-store). |
 | `TSSERVE_LOG_LEVEL` | No | `info` | Log level: `debug`, `info`, `warn`, `error`. |
 | **Discovery** | | | |
 | `TSSERVE_DISCOVERY` | No | `docker` | Discovery backend. `docker` reads `/var/run/docker.sock`. `ecs` queries the AWS ECS API. See [ECS Cluster Mode](#ecs-cluster-mode). |
@@ -650,6 +651,53 @@ When a container restarts, Docker emits `die` then `start`. The stop handler tea
 | `ec2:DescribeInstances` fails for a container instance (ECS mode) | Log warning. Skip this container. Cached host IPs are invalidated on failure so the next poll retries cleanly. |
 | `tsnet.Server.Start()` fails (e.g. bad auth key, OIDC token exchange failure, expired credentials) | Fatal error. Exit with message. For OIDC failures, suggest checking the federated identity configuration in the Tailscale admin console. |
 | Duplicate `tsserve.service` on two containers (Docker mode) or two tasks (ECS mode) | First one wins. Log a warning for the duplicate. If the first stops, the second does NOT auto-register (it would need to be restarted, or ECS mode would need to rediscover it on the next poll cycle). |
+
+---
+
+## Node state store
+
+By default tsnet writes the node's identity — machine key, node key, and prefs —
+to a `tailscaled.state` file under `TSSERVE_STATE_DIR`. On an ephemeral
+filesystem that identity is lost on restart, so the node re-registers as a new
+machine each time.
+
+`TSSERVE_STATE_STORE` sets tsnet's `Server.Store` to an external
+[`ipn.StateStore`](https://pkg.go.dev/tailscale.com/ipn/store), moving that
+identity blob off local disk. The value is passed to `store.New`; the primary
+target is AWS SSM Parameter Store:
+
+```
+TSSERVE_STATE_STORE=arn:aws:ssm:us-east-1:123456789012:parameter/tsserve/node1
+```
+
+An optional `?kmsKey=<alias|id|arn>` encrypts the parameter with a specific KMS
+key (otherwise the account default SSM key is used).
+
+How this interacts with `TSSERVE_STATE_DIR` (see `tsnet.Server.Start`):
+
+- `Store` gates **only** whether tsnet creates the on-disk `tailscaled.state`
+  file. When set, that file is never written; the identity lives in the store.
+- `Dir` (`TSSERVE_STATE_DIR`) is **always** tsnet's var root regardless of
+  `Store`: the directory is still created, and the TLS cert directory
+  (`<dir>/certs`) and `tailscaled.log.conf` still live under it. So
+  `TSSERVE_STATE_DIR` remains required and meaningful.
+
+This composes with the [TLS certificate cache](#tls-certificate-cache) to make
+both halves durable on ECS/Fargate: **identity → SSM, certs → disk mirrored to
+S3.** The whole identity blob is a single SSM parameter and must stay under the
+8 KB advanced-tier limit — not a concern for a normal single-profile node, whose
+state is a few KB.
+
+### IAM permissions
+
+The host's IAM role must permit, scoped to the parameter ARN:
+
+| Action | Purpose |
+|---|---|
+| `ssm:GetParameter` | Load node identity at startup. |
+| `ssm:PutParameter` | Persist identity on change (and create it on first run). |
+
+Add `kms:Encrypt` / `kms:Decrypt` on the key if `?kmsKey=` is used.
 
 ---
 

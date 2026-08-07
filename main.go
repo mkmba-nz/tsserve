@@ -27,6 +27,11 @@ import (
 	// modes are silent no-ops and tsnet falls through to interactive login.
 	_ "tailscale.com/feature/condregister/identityfederation"
 	_ "tailscale.com/feature/condregister/oauthkey"
+	"tailscale.com/ipn/store"
+	// Register the "arn:" state-store prefix (AWS SSM) so TSSERVE_STATE_STORE
+	// can point node identity at an SSM parameter. Without this blank import
+	// store.New only understands file paths, "mem:", and "tpmseal:".
+	_ "tailscale.com/ipn/store/awsstore"
 	"tailscale.com/tsnet"
 
 	"mkmba.nz/tsserve/certsync"
@@ -65,6 +70,21 @@ func run() error {
 		Audience:      os.Getenv("TS_AUDIENCE"),
 		AdvertiseTags: splitTags(os.Getenv("TSSERVE_TAGS")),
 		Logf:          tsnetLogf(logger),
+	}
+
+	// TSSERVE_STATE_STORE, when set, diverts only the node identity
+	// (tailscaled.state: machine/node key and prefs) to an external
+	// ipn.StateStore — e.g. "arn:aws:ssm:<region>:<acct>:parameter/<name>" for
+	// AWS SSM. Dir is still used as tsnet's var root (cert directory, log
+	// config), so it pairs with TSSERVE_STATE_DIR + TSSERVE_CERT_S3_BUCKET:
+	// identity in SSM, certs on disk mirrored to S3.
+	if storeArg := os.Getenv("TSSERVE_STATE_STORE"); storeArg != "" {
+		st, err := store.New(tsnetLogf(logger), storeArg)
+		if err != nil {
+			return fmt.Errorf("state store %q: %w", storeArg, err)
+		}
+		srv.Store = st
+		logger.Info("using external state store", "store", storeArg)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
