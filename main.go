@@ -97,13 +97,24 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	var syncDone chan struct{}
 	if certSync != nil {
-		syncDone = make(chan struct{})
+		syncDone := make(chan struct{})
 		go func() {
 			defer close(syncDone)
 			if err := certSync.Run(ctx); err != nil {
 				logger.Error("cert sync stopped", "error", err)
+			}
+		}()
+		// Guarantee the final sweep runs and completes (bounded) on every
+		// return path, not just the graceful awaitTerminal one: cancel ctx so
+		// the syncer flushes, then wait for it so a cert issued just before
+		// shutdown reaches S3 before the process exits.
+		defer func() {
+			cancel()
+			select {
+			case <-syncDone:
+			case <-time.After(35 * time.Second):
+				logger.Warn("timed out waiting for final cert sync")
 			}
 		}()
 	}
@@ -160,20 +171,7 @@ func run() error {
 	}
 
 	logger.Info("tsserve ready")
-	retErr := awaitTerminal(ctx, fatal, watchErr, localErr, logger)
-
-	// Cancel ctx so the cert syncer performs its final sweep, then wait
-	// (bounded) for it to finish so a cert issued just before shutdown reaches
-	// S3 before the process exits.
-	cancel()
-	if syncDone != nil {
-		select {
-		case <-syncDone:
-		case <-time.After(35 * time.Second):
-			logger.Warn("timed out waiting for final cert sync")
-		}
-	}
-	return retErr
+	return awaitTerminal(ctx, fatal, watchErr, localErr, logger)
 }
 
 // awaitTerminal blocks until the process should shut down, returning the error
@@ -233,8 +231,16 @@ func setupCertSync(ctx context.Context, stateDir string, logger *slog.Logger) (*
 		return nil, err
 	}
 	logger.Info("cert s3 cache enabled", "bucket", bucket, "prefix", prefix, "region", region)
+	// Hydrate is best effort: a transient S3 error or missing object must not
+	// block startup — tsnet simply re-provisions whatever was not restored.
 	if err := syncer.Hydrate(ctx); err != nil {
-		return nil, fmt.Errorf("cert s3 hydrate: %w", err)
+		logger.Warn("cert s3 hydrate failed; continuing, certs will be re-provisioned as needed", "error", err)
+	}
+	// Register the watch before returning (i.e. before srv.Start) so no early
+	// cert write is missed, and so a watcher-setup failure surfaces here rather
+	// than silently disabling the cache in a background goroutine.
+	if err := syncer.Watch(); err != nil {
+		return nil, fmt.Errorf("cert s3 watch: %w", err)
 	}
 	return syncer, nil
 }

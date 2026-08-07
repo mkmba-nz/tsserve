@@ -16,6 +16,7 @@ package certsync
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -56,11 +57,12 @@ type Config struct {
 
 // Syncer mirrors a local cert directory to and from an S3 bucket.
 type Syncer struct {
-	dir    string
-	bucket string
-	prefix string
-	client S3API
-	logger *slog.Logger
+	dir     string
+	bucket  string
+	prefix  string
+	client  S3API
+	logger  *slog.Logger
+	watcher *fsnotify.Watcher
 }
 
 // New returns a Syncer. It creates Dir (0700) if it does not exist so the
@@ -106,6 +108,7 @@ func (s *Syncer) key(name string) string { return s.prefix + name }
 func (s *Syncer) Hydrate(ctx context.Context) error {
 	var token *string
 	restored := 0
+	var errs []error
 	for {
 		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(s.bucket),
@@ -122,8 +125,12 @@ func (s *Syncer) Hydrate(ctx context.Context) error {
 			if name == "" || strings.Contains(name, "/") || !isCertFile(name) {
 				continue
 			}
+			// Best effort: one bad object must not block restoring the rest.
+			// The caller downgrades a returned error to a warning and keeps
+			// serving, so tsnet simply re-provisions whatever failed to restore.
 			if err := s.download(ctx, k, name); err != nil {
-				return err
+				errs = append(errs, err)
+				continue
 			}
 			restored++
 		}
@@ -133,7 +140,7 @@ func (s *Syncer) Hydrate(ctx context.Context) error {
 		token = out.NextContinuationToken
 	}
 	s.logger.Info("hydrated cert cache from s3", "bucket", s.bucket, "prefix", s.prefix, "files", restored)
-	return nil
+	return errors.Join(errs...)
 }
 
 // download fetches one object and writes it atomically into Dir.
@@ -161,19 +168,36 @@ func (s *Syncer) download(ctx context.Context, key, name string) error {
 	return nil
 }
 
-// Run watches Dir and uploads mirrored certs as tsnet writes them, coalescing
-// bursts with a short debounce. It performs a final sweep and returns nil when
-// ctx is cancelled, so callers can wait on it during shutdown to ensure a cert
-// issued just before exit reaches the bucket.
-func (s *Syncer) Run(ctx context.Context) error {
+// Watch registers the filesystem watch on Dir. It must be called (successfully)
+// before Run, and before tsnet starts writing certs, so no early cert write is
+// missed. Keeping it out of Run lets a watcher-setup failure surface to the
+// caller at startup instead of dying silently in a background goroutine.
+func (s *Syncer) Watch() error {
+	if s.watcher != nil {
+		return fmt.Errorf("certsync: Watch already called")
+	}
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("certsync: watcher: %w", err)
 	}
-	defer w.Close()
 	if err := w.Add(s.dir); err != nil {
+		w.Close()
 		return fmt.Errorf("certsync: watch %s: %w", s.dir, err)
 	}
+	s.watcher = w
+	return nil
+}
+
+// Run watches Dir and uploads mirrored certs as tsnet writes them, coalescing
+// bursts with a short debounce. It performs a final sweep and returns nil when
+// ctx is cancelled, so callers can wait on it during shutdown to ensure a cert
+// issued just before exit reaches the bucket. Watch must have been called first.
+func (s *Syncer) Run(ctx context.Context) error {
+	if s.watcher == nil {
+		return fmt.Errorf("certsync: Run called before Watch")
+	}
+	w := s.watcher
+	defer w.Close()
 
 	// Stopped timer, started/reset on each event.
 	timer := time.NewTimer(debounce)
@@ -214,7 +238,9 @@ func (s *Syncer) Run(ctx context.Context) error {
 			s.logger.Warn("cert watcher error", "error", err)
 
 		case <-timer.C:
-			if !pending {
+			// If ctx is already cancelled, let the ctx.Done case own the sweep
+			// (with a fresh context) rather than firing a doomed one here.
+			if !pending || ctx.Err() != nil {
 				continue
 			}
 			pending = false
@@ -231,15 +257,18 @@ func (s *Syncer) syncAll(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("certsync: read dir: %w", err)
 	}
+	var errs []error
 	for _, e := range entries {
 		if e.IsDir() || !isCertFile(e.Name()) {
 			continue
 		}
+		// Best effort: one failed upload must not strand the other certs in
+		// this sweep (notably the final shutdown sweep).
 		if err := s.upload(ctx, e.Name()); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // upload writes one local cert file to the bucket, overwriting any prior object.
