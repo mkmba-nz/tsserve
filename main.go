@@ -16,8 +16,10 @@ import (
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/aws"
 	awsconfigload "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
 	awsecs "github.com/aws/aws-sdk-go-v2/service/ecs"
+	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
 	// Register tsnet auth-key resolvers. Without these blank imports the
 	// TS_CLIENT_ID/TS_AUDIENCE (WIF) and TS_CLIENT_ID/TS_CLIENT_SECRET (OAuth)
 	// modes are silent no-ops and tsnet falls through to interactive login.
@@ -176,51 +178,151 @@ func startWatcher(ctx context.Context, mode string, registrar *registrarAdapter,
 		return nil
 
 	case "ecs":
-		cluster := os.Getenv("TSSERVE_ECS_CLUSTER")
-		if cluster == "" {
-			return errors.New("TSSERVE_ECS_CLUSTER is required when TSSERVE_DISCOVERY=ecs")
-		}
 		interval, err := parsePollInterval(os.Getenv("TSSERVE_ECS_POLL_INTERVAL"))
 		if err != nil {
 			return err
 		}
 
-		// Scope ECS AWS config to tsserve-specific env vars so the
-		// process-wide AWS_PROFILE / AWS_CONFIG_FILE do not leak into
-		// tsnet's WIF flow (which calls LoadDefaultConfig itself and
-		// must resolve to the EC2 instance role identity Tailscale
-		// trusts, not a cross-account role assumed for ECS reads).
-		ecsOpts := []func(*awsconfigload.LoadOptions) error{
-			awsconfigload.WithRetryMode(awsconfig.RetryModeAdaptive),
-			awsconfigload.WithRetryMaxAttempts(5),
-		}
-		if p := os.Getenv("TSSERVE_ECS_AWS_PROFILE"); p != "" {
-			ecsOpts = append(ecsOpts, awsconfigload.WithSharedConfigProfile(p))
-		}
-		if f := os.Getenv("TSSERVE_ECS_AWS_CONFIG_FILE"); f != "" {
-			ecsOpts = append(ecsOpts, awsconfigload.WithSharedConfigFiles([]string{f}))
-		}
-		awsCfg, err := awsconfigload.LoadDefaultConfig(ctx, ecsOpts...)
+		// A single-account configuration (no TSSERVE_ECS_ACCOUNTS) uses the
+		// shared TSSERVE_ECS_* / AWS_REGION env vars directly and behaves
+		// exactly as before. When accounts ARE configured, each fills any
+		// field it leaves blank from the same shared values.
+		accounts, err := ecs.ParseAccounts(os.Getenv("TSSERVE_ECS_ACCOUNTS"))
 		if err != nil {
-			return fmt.Errorf("aws config: %w", err)
+			return err
+		}
+		specs, err := ecs.Plan(accounts, ecs.Defaults{
+			Region:       os.Getenv("AWS_REGION"),
+			Profile:      os.Getenv("TSSERVE_ECS_AWS_PROFILE"),
+			ConfigFile:   os.Getenv("TSSERVE_ECS_AWS_CONFIG_FILE"),
+			Cluster:      os.Getenv("TSSERVE_ECS_CLUSTER"),
+			PollInterval: interval,
+		})
+		if err != nil {
+			return err
+		}
+
+		// Only resolve account IDs (via STS) when accounts are explicitly
+		// configured; the legacy single-account path must not require the
+		// extra sts:GetCallerIdentity permission.
+		watchers, err := buildECSWatchers(ctx, specs, len(accounts) > 0, registrar, logger)
+		if err != nil {
+			return err
+		}
+		logger.Info("ecs discovery configured", "accounts", len(watchers))
+
+		// Run every account's watcher concurrently. Each watcher's Run only
+		// returns on ctx cancellation, so a fan-in coordinator forwards the
+		// first genuine error immediately (else nil once all have exited),
+		// keeping the single watchErr channel main selects on.
+		results := make(chan error, len(watchers))
+		for _, w := range watchers {
+			go func(w *ecs.Watcher) { results <- w.Run(ctx) }(w)
+		}
+		go func() {
+			reported := false
+			for range watchers {
+				if err := <-results; err != nil && !errors.Is(err, context.Canceled) && !reported {
+					watchErr <- err
+					reported = true
+				}
+			}
+			if !reported {
+				watchErr <- nil
+			}
+		}()
+		return nil
+
+	default:
+		return fmt.Errorf("unknown TSSERVE_DISCOVERY=%q; expected 'docker' or 'ecs'", mode)
+	}
+}
+
+// buildECSWatchers turns resolved WatcherSpecs into ready-to-run watchers, one
+// per account. When deriveNames is set, an account without an explicit name has
+// its AWS account ID resolved via STS GetCallerIdentity and used as its log
+// identity; resolved identities must be unique across accounts.
+func buildECSWatchers(
+	ctx context.Context,
+	specs []ecs.WatcherSpec,
+	deriveNames bool,
+	registrar *registrarAdapter,
+	logger *slog.Logger,
+) ([]*ecs.Watcher, error) {
+	watchers := make([]*ecs.Watcher, 0, len(specs))
+	seen := make(map[string]struct{}, len(specs))
+
+	for i, spec := range specs {
+		awsCfg, err := awsConfigForSpec(ctx, spec)
+		if err != nil {
+			return nil, err
+		}
+
+		name := spec.Name
+		if name == "" && deriveNames {
+			ident, err := awssts.NewFromConfig(awsCfg).GetCallerIdentity(ctx, &awssts.GetCallerIdentityInput{})
+			if err != nil {
+				return nil, fmt.Errorf("ecs accounts[%d]: resolve account identity: %w", i, err)
+			}
+			name = awsconfig.ToString(ident.Account)
+			if name == "" {
+				return nil, fmt.Errorf("ecs accounts[%d]: STS returned an empty account id", i)
+			}
+		}
+		if name != "" {
+			if _, dup := seen[name]; dup {
+				return nil, fmt.Errorf("ecs account identity %q resolves more than once; set a unique name", name)
+			}
+			seen[name] = struct{}{}
+			logger.Info("ecs account ready", "account", name, "cluster", spec.Cluster, "region", spec.Region)
 		}
 
 		watcher, err := ecs.NewWatcher(
-			ecs.Config{Cluster: cluster, PollInterval: interval},
+			ecs.Config{Cluster: spec.Cluster, PollInterval: spec.PollInterval, Account: name},
 			awsecs.NewFromConfig(awsCfg),
 			awsec2.NewFromConfig(awsCfg),
 			registrar,
 			logger,
 		)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		go func() { watchErr <- watcher.Run(ctx) }()
-		return nil
-
-	default:
-		return fmt.Errorf("unknown TSSERVE_DISCOVERY=%q; expected 'docker' or 'ecs'", mode)
+		watchers = append(watchers, watcher)
 	}
+	return watchers, nil
+}
+
+// awsConfigForSpec loads the AWS SDK config for one account's credential
+// context. It is deliberately scoped to tsserve's own settings (region,
+// profile, config file, or static credentials) rather than the process-wide
+// AWS_PROFILE / AWS_CONFIG_FILE, so tsnet's WIF flow — which calls
+// LoadDefaultConfig itself and must resolve to the EC2 instance role identity
+// Tailscale trusts — is never pulled onto a cross-account role assumed for ECS
+// reads.
+func awsConfigForSpec(ctx context.Context, spec ecs.WatcherSpec) (awsconfig.Config, error) {
+	opts := []func(*awsconfigload.LoadOptions) error{
+		awsconfigload.WithRetryMode(awsconfig.RetryModeAdaptive),
+		awsconfigload.WithRetryMaxAttempts(5),
+	}
+	if spec.Region != "" {
+		opts = append(opts, awsconfigload.WithRegion(spec.Region))
+	}
+	if spec.Profile != "" {
+		opts = append(opts, awsconfigload.WithSharedConfigProfile(spec.Profile))
+	}
+	if spec.ConfigFile != "" {
+		opts = append(opts, awsconfigload.WithSharedConfigFiles([]string{spec.ConfigFile}))
+	}
+	if spec.AccessKeyID != "" && spec.SecretAccessKey != "" {
+		opts = append(opts, awsconfigload.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(spec.AccessKeyID, spec.SecretAccessKey, ""),
+		))
+	}
+	cfg, err := awsconfigload.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return awsconfig.Config{}, fmt.Errorf("aws config: %w", err)
+	}
+	return cfg, nil
 }
 
 func parsePollInterval(s string) (time.Duration, error) {

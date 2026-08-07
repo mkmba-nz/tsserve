@@ -30,6 +30,10 @@ type Registrar interface {
 type Config struct {
 	Cluster      string
 	PollInterval time.Duration
+	// Account is an identity label (an AWS account ID or an operator-supplied
+	// name) attached to this watcher's log lines. Optional: it is empty in the
+	// single-account configuration, where there is nothing to disambiguate.
+	Account string
 }
 
 // Watcher polls ECS for labelled tasks and drives a Registrar.
@@ -73,11 +77,12 @@ func NewWatcher(cfg Config, ecsAPI ECSAPI, ec2API EC2API, reg Registrar, logger 
 // reconciles.
 func (w *Watcher) Run(ctx context.Context) error {
 	w.logger.Info("ecs watcher starting",
+		"account", w.cfg.Account,
 		"cluster", w.cfg.Cluster,
 		"poll_interval", w.cfg.PollInterval)
 
 	if err := w.cycle(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		w.logger.Warn("ecs initial poll failed", "err", err)
+		w.logger.Warn("ecs initial poll failed", "account", w.cfg.Account, "err", err)
 	}
 
 	for {
@@ -85,7 +90,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 		if err := w.cycle(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			w.logger.Warn("ecs poll cycle failed", "err", err)
+			w.logger.Warn("ecs poll cycle failed", "account", w.cfg.Account, "err", err)
 		}
 	}
 }
