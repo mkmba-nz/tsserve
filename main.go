@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
 	awsecs "github.com/aws/aws-sdk-go-v2/service/ecs"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
 	// Register tsnet auth-key resolvers. Without these blank imports the
 	// TS_CLIENT_ID/TS_AUDIENCE (WIF) and TS_CLIENT_ID/TS_CLIENT_SECRET (OAuth)
@@ -27,6 +29,7 @@ import (
 	_ "tailscale.com/feature/condregister/oauthkey"
 	"tailscale.com/tsnet"
 
+	"mkmba.nz/tsserve/certsync"
 	dockerpkg "mkmba.nz/tsserve/docker"
 	"mkmba.nz/tsserve/ecs"
 	"mkmba.nz/tsserve/labels"
@@ -66,6 +69,24 @@ func run() error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// When an S3 cert cache is configured, restore any previously provisioned
+	// certificates into the state dir before tsnet starts so a fresh (e.g.
+	// ephemeral ECS) task reuses them instead of re-running the ACME flow.
+	certSync, err := setupCertSync(ctx, stateDir, logger)
+	if err != nil {
+		return err
+	}
+	var syncDone chan struct{}
+	if certSync != nil {
+		syncDone = make(chan struct{})
+		go func() {
+			defer close(syncDone)
+			if err := certSync.Run(ctx); err != nil {
+				logger.Error("cert sync stopped", "error", err)
+			}
+		}()
+	}
 
 	logger.Info("starting tsnet", "hostname", hostname, "state_dir", stateDir, "tags", srv.AdvertiseTags)
 	if err := srv.Start(); err != nil {
@@ -119,6 +140,25 @@ func run() error {
 	}
 
 	logger.Info("tsserve ready")
+	retErr := awaitTerminal(ctx, fatal, watchErr, localErr, logger)
+
+	// Cancel ctx so the cert syncer performs its final sweep, then wait
+	// (bounded) for it to finish so a cert issued just before shutdown reaches
+	// S3 before the process exits.
+	cancel()
+	if syncDone != nil {
+		select {
+		case <-syncDone:
+		case <-time.After(35 * time.Second):
+			logger.Warn("timed out waiting for final cert sync")
+		}
+	}
+	return retErr
+}
+
+// awaitTerminal blocks until the process should shut down, returning the error
+// (if any) that should propagate from run.
+func awaitTerminal(ctx context.Context, fatal, watchErr, localErr <-chan error, logger *slog.Logger) error {
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown signal received")
@@ -136,6 +176,47 @@ func run() error {
 		}
 		return fmt.Errorf("local server: %w", err)
 	}
+}
+
+// setupCertSync builds the S3-backed cert cache and restores its contents into
+// <stateDir>/certs. It returns (nil, nil) when TSSERVE_CERT_S3_BUCKET is unset,
+// leaving cert storage entirely on the local disk as before.
+func setupCertSync(ctx context.Context, stateDir string, logger *slog.Logger) (*certsync.Syncer, error) {
+	bucket := os.Getenv("TSSERVE_CERT_S3_BUCKET")
+	if bucket == "" {
+		return nil, nil
+	}
+	prefix := os.Getenv("TSSERVE_CERT_S3_PREFIX")
+	region := envDefault("TSSERVE_CERT_S3_REGION", os.Getenv("AWS_REGION"))
+
+	// The cert-cache S3 client loads its own config (like awsConfigForSpec)
+	// rather than sharing tsnet's, so it stays scoped to its configured region
+	// and does not perturb tsnet's workload-identity credential resolution.
+	opts := []func(*awsconfigload.LoadOptions) error{
+		awsconfigload.WithRetryMode(awsconfig.RetryModeAdaptive),
+		awsconfigload.WithRetryMaxAttempts(5),
+	}
+	if region != "" {
+		opts = append(opts, awsconfigload.WithRegion(region))
+	}
+	cfg, err := awsconfigload.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("cert s3 config: %w", err)
+	}
+
+	syncer, err := certsync.New(certsync.Config{
+		Dir:    filepath.Join(stateDir, "certs"),
+		Bucket: bucket,
+		Prefix: prefix,
+	}, awss3.NewFromConfig(cfg), logger)
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("cert s3 cache enabled", "bucket", bucket, "prefix", prefix, "region", region)
+	if err := syncer.Hydrate(ctx); err != nil {
+		return nil, fmt.Errorf("cert s3 hydrate: %w", err)
+	}
+	return syncer, nil
 }
 
 type registrarAdapter struct {
