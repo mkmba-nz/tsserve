@@ -32,15 +32,38 @@ type Snapshotter interface {
 	Snapshot() []proxy.ServiceView
 }
 
+// ReaderStatus is the status-page view of one configured ECS reader. It mirrors
+// ecs.ReaderStatus so this package stays independent of the ecs package (main
+// adapts between the two).
+type ReaderStatus struct {
+	Name          string
+	Account       string
+	Cluster       string
+	Region        string
+	PollInterval  time.Duration
+	LastPollStart time.Time
+	LastPollOK    time.Time
+	LastError     string
+	Polls         uint64
+	Healthy       bool
+}
+
+// ReaderSnapshotter is the read-only surface exposing configured ECS readers to
+// the status page. It is nil in Docker mode, where no readers table is shown.
+type ReaderSnapshotter interface {
+	Readers() []ReaderStatus
+}
+
 // Server owns both local listeners (tailnet HTTPS + loopback HTTP metrics).
 type Server struct {
 	Logger        *slog.Logger
 	Manager       Snapshotter
 	LocalClient   *local.Client
 	Metrics       *metrics.Collector
-	TraefikPort   int    // 0 = disabled
-	MetricsAddr   string // e.g. "127.0.0.1:9090"; "" disables the metrics listener
-	DiscoveryMode string // for display only
+	TraefikPort   int               // 0 = disabled
+	MetricsAddr   string            // e.g. "127.0.0.1:9090"; "" disables the metrics listener
+	DiscoveryMode string            // for display only
+	Readers       ReaderSnapshotter // nil in Docker mode
 	TSNet         *tsnet.Server
 	Started       time.Time
 }

@@ -30,10 +30,31 @@ type Registrar interface {
 type Config struct {
 	Cluster      string
 	PollInterval time.Duration
+	// RetryInterval is the (typically slower) cadence used while the reader is
+	// unhealthy — e.g. its role is not assumable yet — so a broken reader keeps
+	// retrying without hammering the API or spamming logs. It never polls faster
+	// than PollInterval. Defaults to 2 minutes when unset.
+	RetryInterval time.Duration
 	// Account is an identity label (an AWS account ID or an operator-supplied
 	// name) attached to this watcher's log lines. Optional: it is empty in the
 	// single-account configuration, where there is nothing to disambiguate.
 	Account string
+	// Reader, when set, receives per-cycle poll outcomes so the status page can
+	// show when this reader was last polled and whether it is healthy. Optional:
+	// a nil handle is a no-op.
+	Reader *Reader
+	// ResolveAccount, when set, resolves this reader's AWS account ID (via STS).
+	// It is used only when the account could not be resolved at startup: the
+	// watcher retries it at the start of each cycle until it succeeds, so a
+	// reader whose role becomes assumable later recovers without a restart. A
+	// failure is reported as a failed poll (surfacing on the status page) and
+	// retried at RetryInterval.
+	ResolveAccount func(context.Context) (string, error)
+	// OnAccountResolved, when set, is invoked once with the resolved account ID
+	// the first time ResolveAccount succeeds. It runs on the watcher's own
+	// goroutine before any Register call in that cycle, so callers may use it to
+	// update the service origin tag and reader status.
+	OnAccountResolved func(account string)
 }
 
 // Watcher polls ECS for labelled tasks and drives a Registrar.
@@ -48,6 +69,9 @@ type Watcher struct {
 	active   map[string]string // registration key -> "host:port" of the last successful Register
 	clockNow func() time.Time  // injectable for tests
 	sleepFor func(context.Context, time.Duration) error
+
+	healthy         bool // last cycle succeeded; drives the poll cadence
+	accountResolved bool // ResolveAccount has succeeded (or was never needed)
 }
 
 // NewWatcher returns a Watcher ready to Run.
@@ -57,6 +81,9 @@ func NewWatcher(cfg Config, ecsAPI ECSAPI, ec2API EC2API, reg Registrar, logger 
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 10 * time.Second
+	}
+	if cfg.RetryInterval <= 0 {
+		cfg.RetryInterval = 2 * time.Minute
 	}
 	return &Watcher{
 		cfg:      cfg,
@@ -81,22 +108,75 @@ func (w *Watcher) Run(ctx context.Context) error {
 		"cluster", w.cfg.Cluster,
 		"poll_interval", w.cfg.PollInterval)
 
-	if err := w.cycle(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	if err := w.reportCycle(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		w.logger.Warn("ecs initial poll failed", "account", w.cfg.Account, "err", err)
 	}
 
 	for {
-		if err := w.sleepFor(ctx, w.cfg.PollInterval); err != nil {
+		if err := w.sleepFor(ctx, w.nextInterval()); err != nil {
 			return ctx.Err()
 		}
-		if err := w.cycle(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			w.logger.Warn("ecs poll cycle failed", "account", w.cfg.Account, "err", err)
+		if err := w.reportCycle(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			w.logger.Warn("ecs poll cycle failed",
+				"account", w.cfg.Account, "retry_in", w.nextInterval(), "err", err)
 		}
 	}
 }
 
-// cycle runs one poll-and-diff iteration.
+// nextInterval is how long to wait before the next cycle: the configured
+// PollInterval while healthy, and the slower RetryInterval while degraded (but
+// never faster than PollInterval).
+func (w *Watcher) nextInterval() time.Duration {
+	if w.healthy {
+		return w.cfg.PollInterval
+	}
+	return max(w.cfg.PollInterval, w.cfg.RetryInterval)
+}
+
+// reportCycle runs one cycle, records whether it succeeded (which drives the
+// poll cadence), and reports the outcome to the reader status handle (if any).
+// A context cancellation is a shutdown, not a poll failure, so it is not
+// recorded as an error and leaves the health state untouched.
+func (w *Watcher) reportCycle(ctx context.Context) error {
+	// Don't begin (or record) a poll once shutdown is underway; otherwise the
+	// reader's last-poll timestamp would advance for a cycle that never ran.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	w.cfg.Reader.PollStarted(w.clockNow())
+	err := w.cycle(ctx)
+	switch {
+	case err == nil:
+		w.healthy = true
+		w.cfg.Reader.PollSucceeded(w.clockNow())
+	case errors.Is(err, context.Canceled):
+		// Shutdown in flight; leave the last outcome untouched.
+	default:
+		w.healthy = false
+		w.cfg.Reader.PollFailed(w.clockNow(), err)
+	}
+	return err
+}
+
+// cycle runs one poll-and-diff iteration. When the reader's account identity
+// could not be resolved at startup it is retried here first, so a reader whose
+// role only becomes assumable later recovers on its own.
 func (w *Watcher) cycle(ctx context.Context) error {
+	if !w.accountResolved && w.cfg.ResolveAccount != nil {
+		account, err := w.cfg.ResolveAccount(ctx)
+		if err != nil {
+			return fmt.Errorf("resolve account identity: %w", err)
+		}
+		w.accountResolved = true
+		if w.cfg.OnAccountResolved != nil {
+			w.cfg.OnAccountResolved(account)
+		}
+		w.logger.Info("ecs reader identity resolved",
+			"was", w.cfg.Account, "account", account, "cluster", w.cfg.Cluster)
+		// Keep this watcher's own log label in step with the resolved identity.
+		w.cfg.Account = account
+	}
+
 	taskArns, err := w.listAllTaskArns(ctx)
 	if err != nil {
 		return err

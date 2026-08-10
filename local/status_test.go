@@ -16,6 +16,10 @@ type fakeSnapshotter struct{ services []proxy.ServiceView }
 
 func (f *fakeSnapshotter) Snapshot() []proxy.ServiceView { return f.services }
 
+type fakeReaderSource struct{ readers []ReaderStatus }
+
+func (f *fakeReaderSource) Readers() []ReaderStatus { return f.readers }
+
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
@@ -88,6 +92,80 @@ func TestRowsFor_MapsServiceFields(t *testing.T) {
 	}
 	if !strings.HasSuffix(r.RegisteredAgo, " ago") {
 		t.Errorf("RegisteredAgo = %q, want suffix ' ago'", r.RegisteredAgo)
+	}
+}
+
+func TestRowsFor_IncludesOrigin(t *testing.T) {
+	rows := rowsFor([]proxy.ServiceView{{
+		Service:      "svc:web",
+		Backend:      "http://10.0.0.1:80",
+		ContainerID:  "abc",
+		RegisteredAt: time.Now(),
+		Origin:       proxy.Origin{Account: "077542728448", Cluster: "border"},
+	}})
+	if rows[0].Account != "077542728448" || rows[0].Cluster != "border" {
+		t.Errorf("origin not mapped onto row: %+v", rows[0])
+	}
+}
+
+func TestReaderRowsFor_States(t *testing.T) {
+	now := time.Now()
+	rows := readerRowsFor(&fakeReaderSource{readers: []ReaderStatus{
+		{Name: "healthy", Cluster: "c1", PollInterval: 10 * time.Second, Healthy: true, LastPollOK: now.Add(-5 * time.Second)},
+		{Name: "broken", Cluster: "c2", PollInterval: 10 * time.Second, LastError: "AccessDenied"},
+		{Name: "fresh", Cluster: "c3", PollInterval: 10 * time.Second},
+	}})
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3", len(rows))
+	}
+	if rows[0].State != "healthy" || rows[0].LastPolled == "never" {
+		t.Errorf("healthy row wrong: %+v", rows[0])
+	}
+	if rows[1].State != "error" || rows[1].LastError != "AccessDenied" {
+		t.Errorf("broken row wrong: %+v", rows[1])
+	}
+	if rows[2].State != "pending" || rows[2].LastPolled != "never" {
+		t.Errorf("fresh row wrong: %+v", rows[2])
+	}
+}
+
+func TestReaderRowsFor_NilSource(t *testing.T) {
+	if got := readerRowsFor(nil); got != nil {
+		t.Errorf("nil source should yield nil rows, got %v", got)
+	}
+}
+
+func TestStatusHandler_RendersReadersTable(t *testing.T) {
+	s := newTestServer(&fakeSnapshotter{})
+	s.DiscoveryMode = "ecs"
+	s.Readers = &fakeReaderSource{readers: []ReaderStatus{
+		{Name: "border", Account: "077542728448", Cluster: "border-ecs", Region: "ap-southeast-2",
+			PollInterval: 10 * time.Second, LastError: "AccessDenied: not authorized to perform: sts:AssumeRole"},
+	}}
+
+	rr := httptest.NewRecorder()
+	s.statusHandler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := rr.Body.String()
+
+	for _, want := range []string{
+		"Readers (1)",
+		"077542728448",
+		"border-ecs",
+		"ap-southeast-2",
+		"AccessDenied",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+}
+
+func TestStatusHandler_NoReadersTableInDockerMode(t *testing.T) {
+	s := newTestServer(&fakeSnapshotter{}) // Readers is nil
+	rr := httptest.NewRecorder()
+	s.statusHandler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	if strings.Contains(rr.Body.String(), "<h2>Readers") {
+		t.Errorf("readers table should be hidden when no reader source is wired")
 	}
 }
 

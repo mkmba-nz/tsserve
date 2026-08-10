@@ -31,6 +31,7 @@ type statusData struct {
 	TraefikPort    int
 	Tailnet        tailnetView
 	Services       []serviceRow
+	Readers        []readerRow
 	Build          buildView
 }
 
@@ -51,6 +52,23 @@ type serviceRow struct {
 	Caps           []string
 	ContainerShort string
 	RegisteredAgo  string
+	// Origin identifies the ECS reader (account + cluster) a service was
+	// discovered from. Both are empty for Docker discovery.
+	Account string
+	Cluster string
+}
+
+// readerRow is the status-page view of one configured ECS reader.
+type readerRow struct {
+	Name         string
+	Account      string
+	Cluster      string
+	Region       string
+	PollInterval string
+	LastPolled   string
+	State        string // "healthy" | "error" | "pending"
+	StateLabel   string
+	LastError    string
 }
 
 type buildView struct {
@@ -76,6 +94,7 @@ func (s *Server) statusHandler() http.HandlerFunc {
 			TraefikPort:    s.TraefikPort,
 			Tailnet:        readTailnet(ctx, s.LocalClient),
 			Services:       rowsFor(s.Manager.Snapshot()),
+			Readers:        readerRowsFor(s.Readers),
 			Build:          build,
 		}
 		data.Hostname = data.Tailnet.Hostname
@@ -124,7 +143,46 @@ func rowsFor(services []proxy.ServiceView) []serviceRow {
 			Caps:           s.Caps,
 			ContainerShort: shortID(s.ContainerID),
 			RegisteredAgo:  humanDuration(now.Sub(s.RegisteredAt)) + " ago",
+			Account:        s.Origin.Account,
+			Cluster:        s.Origin.Cluster,
 		})
+	}
+	return out
+}
+
+// readerRowsFor renders the configured-readers table. It returns nil when no
+// reader source is wired (Docker mode) or none are configured, so the template
+// hides the section entirely.
+func readerRowsFor(src ReaderSnapshotter) []readerRow {
+	if src == nil {
+		return nil
+	}
+	now := time.Now()
+	readers := src.Readers()
+	out := make([]readerRow, 0, len(readers))
+	for _, r := range readers {
+		row := readerRow{
+			Name:         r.Name,
+			Account:      r.Account,
+			Cluster:      r.Cluster,
+			Region:       r.Region,
+			PollInterval: humanDuration(r.PollInterval),
+			LastError:    r.LastError,
+		}
+		switch {
+		case r.Healthy:
+			row.State, row.StateLabel = "healthy", "healthy"
+		case r.LastError != "":
+			row.State, row.StateLabel = "error", "unreachable"
+		default:
+			row.State, row.StateLabel = "pending", "pending"
+		}
+		if r.LastPollOK.IsZero() {
+			row.LastPolled = "never"
+		} else {
+			row.LastPolled = humanDuration(now.Sub(r.LastPollOK)) + " ago"
+		}
+		out = append(out, row)
 	}
 	return out
 }

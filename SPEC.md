@@ -225,6 +225,7 @@ tsserve supports three authentication modes. The first matching mode wins, check
 | `TSSERVE_ECS_CLUSTER` | ✱✱✱ | — | ECS cluster name or ARN to watch. Required when `TSSERVE_DISCOVERY=ecs`, unless every entry in `TSSERVE_ECS_ACCOUNTS` supplies its own `cluster`. In multi-account mode it is the shared default cluster. |
 | `TSSERVE_ECS_ACCOUNTS` | No | — | JSON array of accounts to discover, one poller per entry, each with its own credential context. Unset ⇒ single-account mode using the vars below. See [Multiple AWS accounts](#multiple-aws-accounts). |
 | `TSSERVE_ECS_POLL_INTERVAL` | No | `10s` | How often to poll the ECS API for task changes. Go duration format. Applies to every account. |
+| `TSSERVE_ECS_RETRY_INTERVAL` | No | `2m` | Slower cadence used to retry an **unhealthy** reader (e.g. one whose role is not assumable yet). While a reader is failing it polls at this interval instead of `TSSERVE_ECS_POLL_INTERVAL`, so a single broken reader keeps retrying — and recovers automatically once fixed — without hammering the API or blocking the daemon. Never faster than the poll interval. |
 | `TSSERVE_ECS_AWS_PROFILE` | No | — | Shared-config profile to use **only** for the ECS discovery client. Set this instead of `AWS_PROFILE` so tsnet's WIF flow still resolves to the default (instance-role) identity Tailscale trusts. In multi-account mode it is the shared default profile. |
 | `TSSERVE_ECS_AWS_CONFIG_FILE` | No | — | Shared-config file path for the ECS discovery client only. Set this instead of `AWS_CONFIG_FILE` to keep the WIF credential chain clean. In multi-account mode it is the shared default config file. |
 | `AWS_REGION` | ✱✱✱ | — | Standard AWS env var. Required when `TSSERVE_DISCOVERY=ecs` if not derivable from instance metadata or IAM role. Safe to set process-wide — it does not affect identity. In multi-account mode it is the shared default region. |
@@ -400,6 +401,27 @@ profile assumes; when `name` is omitted, that role must additionally allow
 `sts:GetCallerIdentity` so tsserve can derive the account ID. As in single-account mode, these
 profiles are scoped to the ECS clients only — tsnet's WIF auth flow keeps using the host's
 default (instance-role) identity, never a cross-account reader role.
+
+#### Reader resilience
+
+One misconfigured reader never blocks the rest. If a reader's role is not assumable — a
+cross-account trust policy not yet in place, so `sts:GetCallerIdentity` or `ListTasks` returns
+`403 AccessDenied` — that reader does **not** abort daemon startup. It is created anyway, its
+account identity is resolved lazily, and it retries on the slower `TSSERVE_ECS_RETRY_INTERVAL`
+cadence (default `2m`) until the role becomes assumable, at which point it recovers on its own
+with no restart. The other readers start and serve normally throughout.
+
+Every configured reader — healthy, still resolving, or failing — appears in the **Readers**
+table on the [status page](#observability-and-local-endpoints), with its cluster, region, resolved account ID, poll
+interval, last-polled time, and current state. A failing reader is highlighted with its last
+error, so an unassumable role is diagnosable at a glance rather than only in the logs. Each
+service in the **Services** table is likewise tagged with the account and cluster it was
+discovered from.
+
+Only a hard *local* misconfiguration disables a reader outright (rather than retrying): AWS
+config that will not load, or two readers resolving to the same account identity. If every
+reader hits such an error the daemon still runs — discovering nothing — instead of
+crash-looping.
 
 ### Where labels live
 
@@ -764,7 +786,7 @@ Available at `https://<TSSERVE_HOSTNAME>.<tailnet>.ts.net/`. Uses `tsnet.Server.
 
 | Path | Purpose |
 |---|---|
-| `/` | Single-page HTML status: tailnet identity (hostname, FQDN, tailnet name, MagicDNS suffix, node IPs, backend state), discovery mode, uptime, build info, and a table of currently registered services (service name → backend → caps → container → registered time). No JavaScript, no external assets. |
+| `/` | Single-page HTML status: tailnet identity (hostname, FQDN, tailnet name, MagicDNS suffix, node IPs, backend state), discovery mode, uptime, build info, and a table of currently registered services (service name → backend → caps → account → cluster → container → registered time). In ECS mode it additionally renders a **Readers** table — one row per configured reader (name → account ID → cluster → region → poll interval → last polled → state), with unhealthy readers highlighted and their last error shown, so an unassumable role is visible at a glance. No JavaScript, no external assets. |
 | `/traefik`, `/traefik/...` | Reverse proxy to `http://localhost:<TSSERVE_TRAEFIK_PORT>` with the `/traefik` prefix stripped before forwarding. Intended for reaching a Traefik dashboard on the same host. Returns 404 with a one-line hint when `TSSERVE_TRAEFIK_PORT` is not set. |
 | `/metrics` | 404 with a hint pointing at the loopback metrics listener. |
 
