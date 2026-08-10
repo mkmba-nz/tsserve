@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -140,6 +141,10 @@ func run() error {
 	mgr := proxy.NewManager(srv, lc, logger, mc)
 	defer mgr.Close()
 
+	// readers tracks per-reader ECS discovery status for the status page. It
+	// stays empty in Docker mode.
+	readers := ecs.NewRegistry()
+
 	discoveryMode := strings.ToLower(envDefault("TSSERVE_DISCOVERY", "docker"))
 
 	traefikPort, err := local.ParseTraefikPort(os.Getenv("TSSERVE_TRAEFIK_PORT"))
@@ -158,6 +163,7 @@ func run() error {
 		DiscoveryMode: discoveryMode,
 		TSNet:         srv,
 		Started:       time.Now(),
+		Readers:       readerSource{readers},
 	}
 	localErr := make(chan error, 1)
 	go func() { localErr <- localSrv.Run(ctx) }()
@@ -166,7 +172,7 @@ func run() error {
 	registrar := &registrarAdapter{mgr: mgr, fatal: fatal}
 
 	watchErr := make(chan error, 1)
-	if err := startWatcher(ctx, discoveryMode, registrar, logger, watchErr); err != nil {
+	if err := startWatcher(ctx, discoveryMode, registrar, readers, logger, watchErr); err != nil {
 		return err
 	}
 
@@ -245,9 +251,37 @@ func setupCertSync(ctx context.Context, stateDir string, logger *slog.Logger) (*
 	return syncer, nil
 }
 
+// readerSource adapts the ecs reader Registry to the local package's
+// ReaderSnapshotter, converting between the two mirrored status types so local
+// need not import ecs.
+type readerSource struct{ reg *ecs.Registry }
+
+func (s readerSource) Readers() []local.ReaderStatus {
+	src := s.reg.Snapshot()
+	out := make([]local.ReaderStatus, len(src))
+	for i, r := range src {
+		out[i] = local.ReaderStatus{
+			Name:          r.Name,
+			Account:       r.Account,
+			Cluster:       r.Cluster,
+			Region:        r.Region,
+			PollInterval:  r.PollInterval,
+			LastPollStart: r.LastPollStart,
+			LastPollOK:    r.LastPollOK,
+			LastError:     r.LastError,
+			Polls:         r.Polls,
+			Healthy:       r.Healthy,
+		}
+	}
+	return out
+}
+
 type registrarAdapter struct {
 	mgr   *proxy.Manager
 	fatal chan<- error
+	// origin tags every service this adapter registers with its discovery
+	// source. It is zero for Docker discovery and set per-reader for ECS.
+	origin proxy.Origin
 }
 
 func (a *registrarAdapter) Register(containerID string, def *labels.ServiceDef, backendIP string) error {
@@ -257,6 +291,7 @@ func (a *registrarAdapter) Register(containerID string, def *labels.ServiceDef, 
 		Network: def.Network,
 		Scheme:  def.Scheme,
 		Caps:    def.Caps,
+		Origin:  a.origin,
 	}, backendIP)
 	if fatalErr, ok := errors.AsType[*proxy.FatalError](err); ok {
 		select {
@@ -271,7 +306,7 @@ func (a *registrarAdapter) Deregister(containerID string) { a.mgr.Deregister(con
 
 // startWatcher selects and starts the configured discovery backend, sending
 // its terminal error (or nil on clean shutdown) on watchErr.
-func startWatcher(ctx context.Context, mode string, registrar *registrarAdapter, logger *slog.Logger, watchErr chan<- error) error {
+func startWatcher(ctx context.Context, mode string, registrar *registrarAdapter, readers *ecs.Registry, logger *slog.Logger, watchErr chan<- error) error {
 	switch mode {
 	case "docker":
 		watcher, err := dockerpkg.NewWatcher(registrar, logger)
@@ -286,6 +321,10 @@ func startWatcher(ctx context.Context, mode string, registrar *registrarAdapter,
 
 	case "ecs":
 		interval, err := parsePollInterval(os.Getenv("TSSERVE_ECS_POLL_INTERVAL"))
+		if err != nil {
+			return err
+		}
+		retryInterval, err := parseRetryInterval(os.Getenv("TSSERVE_ECS_RETRY_INTERVAL"))
 		if err != nil {
 			return err
 		}
@@ -312,11 +351,25 @@ func startWatcher(ctx context.Context, mode string, registrar *registrarAdapter,
 		// Only resolve account IDs (via STS) when accounts are explicitly
 		// configured; the legacy single-account path must not require the
 		// extra sts:GetCallerIdentity permission.
-		watchers, err := buildECSWatchers(ctx, specs, len(accounts) > 0, registrar, logger)
+		watchers, err := buildECSWatchers(ctx, specs, len(accounts) > 0, retryInterval, registrar, readers, logger)
 		if err != nil {
 			return err
 		}
-		logger.Info("ecs discovery configured", "accounts", len(watchers))
+		if len(watchers) == 0 {
+			// Every configured reader hit a hard local misconfiguration (e.g. an
+			// AWS config file that will not load). Unassumable-role readers are
+			// NOT counted here — they keep retrying. Don't crash-loop: the
+			// readers table surfaces why, and a config fix + restart recovers.
+			//
+			// Deliberately do NOT send on watchErr: a nil there would be received
+			// by awaitTerminal and exit the process. With no watcher running, the
+			// daemon stays up on ctx.Done()/localErr, serving the status page so
+			// the failed readers remain visible until shutdown.
+			logger.Error("ecs discovery: no readers could be initialised; " +
+				"the daemon will run but discover nothing until the configuration is fixed")
+			return nil
+		}
+		logger.Info("ecs discovery configured", "readers", len(watchers), "configured", len(specs))
 
 		// Run every account's watcher concurrently. Each watcher's Run only
 		// returns on ctx cancellation, so a fan-in coordinator forwards the
@@ -346,57 +399,157 @@ func startWatcher(ctx context.Context, mode string, registrar *registrarAdapter,
 }
 
 // buildECSWatchers turns resolved WatcherSpecs into ready-to-run watchers, one
-// per account. When deriveNames is set, an account without an explicit name has
-// its AWS account ID resolved via STS GetCallerIdentity and used as its log
-// identity; resolved identities must be unique across accounts.
+// per account, registering each reader's status in readers. When deriveNames is
+// set, an account without an explicit name has its AWS account ID resolved via
+// STS GetCallerIdentity and used as its log identity.
+//
+// Resilience is the whole point here: a reader whose role is not assumable yet
+// (STS/ECS returns 403) must never abort the daemon or be dropped. Its account
+// identity is resolved lazily by the watcher, which keeps retrying at the slow
+// retryInterval until the role becomes assumable — recovering with no restart.
+// Such a reader stays in the readers registry marked unhealthy so it surfaces,
+// highlighted, on the status page. Only a hard local misconfiguration (AWS
+// config that will not load, or a duplicate identity) disables a reader
+// outright; the daemon still starts with whatever readers remain.
 func buildECSWatchers(
 	ctx context.Context,
 	specs []ecs.WatcherSpec,
 	deriveNames bool,
-	registrar *registrarAdapter,
+	retryInterval time.Duration,
+	base *registrarAdapter,
+	readers *ecs.Registry,
 	logger *slog.Logger,
 ) ([]*ecs.Watcher, error) {
 	watchers := make([]*ecs.Watcher, 0, len(specs))
-	seen := make(map[string]struct{}, len(specs))
+
+	// identities dedupes resolved account IDs across readers (including those
+	// resolved lazily, on watcher goroutines) so two readers pointing at the
+	// same account do not silently double-register.
+	var idMu sync.Mutex
+	identities := make(map[string]struct{}, len(specs))
+	claim := func(id string) bool {
+		idMu.Lock()
+		defer idMu.Unlock()
+		if _, dup := identities[id]; dup {
+			return false
+		}
+		identities[id] = struct{}{}
+		return true
+	}
 
 	for i, spec := range specs {
+		// A stable display identity for the readers table, even before (or
+		// without) an STS-resolved account id.
+		display := spec.Name
+		if display == "" {
+			if deriveNames {
+				display = fmt.Sprintf("accounts[%d]", i)
+			} else {
+				display = "default"
+			}
+		}
+		reader := readers.Add(ecs.ReaderStatus{
+			Name:         display,
+			Cluster:      spec.Cluster,
+			Region:       spec.Region,
+			PollInterval: pollIntervalOrDefault(spec.PollInterval),
+		})
+
 		awsCfg, err := awsConfigForSpec(ctx, spec)
 		if err != nil {
-			return nil, err
+			reader.NoteError(err)
+			logger.Error("ecs reader disabled: aws config failed",
+				"reader", display, "cluster", spec.Cluster, "err", err)
+			continue
 		}
 
-		name := spec.Name
-		if name == "" && deriveNames {
-			ident, err := awssts.NewFromConfig(awsCfg).GetCallerIdentity(ctx, &awssts.GetCallerIdentityInput{})
-			if err != nil {
-				return nil, fmt.Errorf("ecs accounts[%d]: resolve account identity: %w", i, err)
-			}
-			name = awsconfig.ToString(ident.Account)
-			if name == "" {
-				return nil, fmt.Errorf("ecs accounts[%d]: STS returned an empty account id", i)
-			}
+		// Each reader gets its own registrar so the services it advertises are
+		// tagged with its origin, sharing the manager and fatal channel. origin
+		// is only ever read/written on this reader's single watcher goroutine
+		// (Register and OnAccountResolved both run there), so no lock is needed.
+		reg := *base
+		reg.origin = proxy.Origin{Account: display, Cluster: spec.Cluster, Region: spec.Region}
+
+		cfg := ecs.Config{
+			Cluster:       spec.Cluster,
+			PollInterval:  spec.PollInterval,
+			RetryInterval: retryInterval,
+			Account:       display,
+			Reader:        reader,
 		}
-		if name != "" {
-			if _, dup := seen[name]; dup {
-				return nil, fmt.Errorf("ecs account identity %q resolves more than once; set a unique name", name)
+
+		// A derived reader (no explicit name) needs its account ID from STS. Try
+		// once up front for a clean startup log and immediate table data; on
+		// failure, hand the watcher a resolver so it keeps retrying rather than
+		// giving up. An explicit name skips STS entirely.
+		if spec.Name == "" && deriveNames {
+			stsClient := awssts.NewFromConfig(awsCfg)
+			resolve := func(ctx context.Context) (string, error) {
+				out, err := stsClient.GetCallerIdentity(ctx, &awssts.GetCallerIdentityInput{})
+				if err != nil {
+					return "", err
+				}
+				account := awsconfig.ToString(out.Account)
+				if account == "" {
+					return "", errors.New("STS returned an empty account id")
+				}
+				return account, nil
 			}
-			seen[name] = struct{}{}
-			logger.Info("ecs account ready", "account", name, "cluster", spec.Cluster, "region", spec.Region)
+			onResolved := func(account string) {
+				if !claim(account) {
+					logger.Warn("ecs reader identity is a duplicate; its services may be ignored",
+						"reader", display, "identity", account)
+				}
+				reg.origin.Account = account
+				// cfg.Account only takes effect in the eager path below, where
+				// this runs before NewWatcher copies cfg. On lazy resolution the
+				// watcher updates its own copy's label (see watcher.go), so this
+				// write is a harmless no-op there.
+				cfg.Account = account
+				reader.SetAccount(account)
+			}
+
+			if account, err := resolve(ctx); err != nil {
+				reader.NoteError(fmt.Errorf("resolve account identity: %w", err))
+				logger.Warn("ecs reader identity unresolved (role not assumable yet?); will keep retrying",
+					"reader", display, "cluster", spec.Cluster, "retry_interval", retryInterval, "err", err)
+				cfg.ResolveAccount = resolve
+				cfg.OnAccountResolved = onResolved
+			} else {
+				onResolved(account)
+			}
+		} else if spec.Name != "" {
+			// Explicit names are unique by construction (ecs.Plan enforces it),
+			// so recording it just keeps a lazily-resolved account from colliding.
+			claim(spec.Name)
 		}
+
+		logger.Info("ecs reader ready", "reader", display, "cluster", spec.Cluster, "region", spec.Region)
 
 		watcher, err := ecs.NewWatcher(
-			ecs.Config{Cluster: spec.Cluster, PollInterval: spec.PollInterval, Account: name},
+			cfg,
 			awsecs.NewFromConfig(awsCfg),
 			awsec2.NewFromConfig(awsCfg),
-			registrar,
+			&reg,
 			logger,
 		)
 		if err != nil {
-			return nil, err
+			reader.NoteError(err)
+			logger.Error("ecs reader disabled: watcher construction failed", "reader", display, "err", err)
+			continue
 		}
 		watchers = append(watchers, watcher)
 	}
 	return watchers, nil
+}
+
+// pollIntervalOrDefault mirrors the default ecs.NewWatcher applies to a
+// non-positive interval, so the readers table shows the interval actually used.
+func pollIntervalOrDefault(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 10 * time.Second
+	}
+	return d
 }
 
 // awsConfigForSpec loads the AWS SDK config for one account's credential
@@ -442,6 +595,22 @@ func parsePollInterval(s string) (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("TSSERVE_ECS_POLL_INTERVAL must be positive, got %s", s)
+	}
+	return d, nil
+}
+
+// parseRetryInterval reads the slow cadence used to retry unhealthy readers. An
+// empty value yields 0, letting ecs.NewWatcher apply its 2-minute default.
+func parseRetryInterval(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("TSSERVE_ECS_RETRY_INTERVAL=%q: %w", s, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("TSSERVE_ECS_RETRY_INTERVAL must be positive, got %s", s)
 	}
 	return d, nil
 }

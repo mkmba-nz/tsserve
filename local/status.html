@@ -7,10 +7,10 @@
 <style>
   :root {
     --bg: #fafafa; --fg: #111; --muted: #555; --border: #e0e0e0;
-    --accent: #0066cc; --ok: #097a3e; --warn: #a15c00;
+    --accent: #0066cc; --ok: #097a3e; --warn: #a15c00; --bad: #c0281f; --bad-bg: #fceceb;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg: #181818; --fg: #eee; --muted: #aaa; --border: #333; --accent: #6db3ff; --ok: #6dd092; --warn: #e2b074; }
+    :root { --bg: #181818; --fg: #eee; --muted: #aaa; --border: #333; --accent: #6db3ff; --ok: #6dd092; --warn: #e2b074; --bad: #ff7a70; --bad-bg: #2a1615; }
   }
   body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     background: var(--bg); color: var(--fg); margin: 0; padding: 2rem; max-width: 1100px; }
@@ -24,11 +24,15 @@
   .pill { display: inline-block; padding: 0.05em 0.5em; border-radius: 0.6em; border: 1px solid var(--border); font-size: 0.85em; }
   .ok { color: var(--ok); border-color: var(--ok); }
   .warn { color: var(--warn); border-color: var(--warn); }
+  .bad { color: var(--bad); border-color: var(--bad); }
+  tr.bad td { background: var(--bad-bg); }
   .grid { display: grid; grid-template-columns: max-content 1fr; gap: 0.3em 1.2em; }
   .grid dt { color: var(--muted); }
   .grid dd { margin: 0; }
   a { color: var(--accent); }
   .empty { color: var(--muted); font-style: italic; }
+  .err { color: var(--bad); font-size: 0.82em; margin-top: 0.3em; max-width: 32em;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   footer { margin-top: 3em; color: var(--muted); font-size: 0.85em; }
 </style>
 </head>
@@ -54,11 +58,36 @@
   <p class="empty">Local tailnet status could not be read: {{.Tailnet.Error}}</p>
   {{end}}
 
+  {{if .Readers}}
+  <h2>Readers ({{len .Readers}})</h2>
+  <table>
+    <thead>
+      <tr><th>Reader</th><th>Account</th><th>Cluster</th><th>Region</th><th>Poll</th><th>Last polled</th><th>State</th></tr>
+    </thead>
+    <tbody>
+      {{range .Readers}}
+      <tr{{if eq .State "error"}} class="bad"{{end}}>
+        <td class="mono">{{.Name}}</td>
+        <td class="mono">{{if .Account}}{{.Account}}{{else}}<span class="empty">—</span>{{end}}</td>
+        <td class="mono">{{.Cluster}}</td>
+        <td class="mono">{{if .Region}}{{.Region}}{{else}}<span class="empty">—</span>{{end}}</td>
+        <td>{{.PollInterval}}</td>
+        <td>{{.LastPolled}}</td>
+        <td>
+          <span class="pill {{if eq .State "healthy"}}ok{{else if eq .State "error"}}bad{{end}}">{{.StateLabel}}</span>
+          {{if .LastError}}<div class="err mono" title="{{.LastError}}">{{.LastError}}</div>{{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{end}}
+
   <h2>Services ({{len .Services}})</h2>
   {{if .Services}}
   <table>
     <thead>
-      <tr><th>Service</th><th>Backend</th><th>Caps</th><th>Container</th><th>Registered</th></tr>
+      <tr><th>Service</th><th>Backend</th><th>Caps</th><th>Account</th><th>Cluster</th><th>Container</th><th>Registered</th></tr>
     </thead>
     <tbody>
       {{range .Services}}
@@ -66,6 +95,8 @@
         <td class="mono">{{.Service}}</td>
         <td class="mono">{{.Backend}}</td>
         <td>{{if .Caps}}<span class="mono">{{range $i, $c := .Caps}}{{if $i}}, {{end}}{{$c}}{{end}}</span>{{else}}<span class="empty">—</span>{{end}}</td>
+        <td class="mono">{{if .Account}}{{.Account}}{{else}}<span class="empty">—</span>{{end}}</td>
+        <td class="mono">{{if .Cluster}}{{.Cluster}}{{else}}<span class="empty">—</span>{{end}}</td>
         <td class="mono">{{.ContainerShort}}</td>
         <td>{{.RegisteredAgo}}</td>
       </tr>

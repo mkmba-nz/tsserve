@@ -63,6 +63,7 @@ type defSnapshot struct {
 	Caps         []string
 	ContainerID  string
 	RegisteredAt time.Time
+	Origin       Origin
 }
 
 // ServiceView is a defensive copy of an active service's state, returned by
@@ -76,6 +77,7 @@ type ServiceView struct {
 	Caps         []string
 	ContainerID  string
 	RegisteredAt time.Time
+	Origin       Origin
 }
 
 // NewManager wraps a tsnet.Server that has already started successfully.
@@ -106,6 +108,18 @@ type ServiceDef struct {
 	Network string
 	Scheme  string
 	Caps    []string
+	// Origin identifies the discovery source this service came from (which ECS
+	// reader/account/cluster). It is zero for Docker discovery.
+	Origin Origin
+}
+
+// Origin records which discovery source advertised a service. For ECS
+// discovery it names the reader (account/cluster) the task was found in; for
+// Docker discovery it is left zero.
+type Origin struct {
+	Account string
+	Cluster string
+	Region  string
 }
 
 // Register provisions a Tailscale Service listener for def and begins serving
@@ -186,6 +200,7 @@ func (m *Manager) Register(containerID string, def *ServiceDef, backendIP string
 		Caps:         append([]string(nil), def.Caps...),
 		ContainerID:  containerID,
 		RegisteredAt: time.Now(),
+		Origin:       def.Origin,
 	}
 
 	m.mu.Lock()
@@ -260,6 +275,7 @@ func (m *Manager) Snapshot() []ServiceView {
 			Caps:         append([]string(nil), s.def.Caps...),
 			ContainerID:  s.def.ContainerID,
 			RegisteredAt: s.def.RegisteredAt,
+			Origin:       s.def.Origin,
 		})
 	}
 	m.mu.Unlock()
