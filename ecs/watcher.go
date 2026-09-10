@@ -67,7 +67,14 @@ type Watcher struct {
 	taskDefs *taskDefCache
 	hostIPs  *hostIPCache
 	active   map[string]string // registration key -> "host:port" of the last successful Register
-	clockNow func() time.Time  // injectable for tests
+	// failed maps a registration key whose last Register attempt did not put a
+	// backend into service to what that attempt said, so one that keeps failing
+	// the same way (or keeps being refused) is logged once rather than on every
+	// poll cycle, while a key that starts failing differently is surfaced again.
+	// Entries are dropped as soon as the key succeeds or stops being seen, so a
+	// task that once failed leaks nothing.
+	failed   map[string]string
+	clockNow func() time.Time // injectable for tests
 	sleepFor func(context.Context, time.Duration) error
 
 	healthy         bool // last cycle succeeded; drives the poll cadence
@@ -94,6 +101,7 @@ func NewWatcher(cfg Config, ecsAPI ECSAPI, ec2API EC2API, reg Registrar, logger 
 		taskDefs: newTaskDefCache(),
 		hostIPs:  newHostIPCache(),
 		active:   map[string]string{},
+		failed:   map[string]string{},
 		clockNow: time.Now,
 		sleepFor: ctxSleep,
 	}, nil
@@ -256,7 +264,11 @@ func (w *Watcher) applyTask(
 			continue
 		}
 		if _, registered := w.active[key]; registered {
+			// The backend moved. Drop the record now, not after the Register
+			// below: if that fails, nothing is serving this key and leaving the
+			// old address behind would claim otherwise.
 			w.reg.Deregister(key)
+			delete(w.active, key)
 		}
 
 		// Manager wants def.Port to point at the backend port; for bridge mode
@@ -264,21 +276,47 @@ func (w *Watcher) applyTask(
 		defForRegister := *def
 		defForRegister.Port = backend.port
 
+		// A key is recorded active only once Register reports the backend is in
+		// the pool of a serving service. Leaving a failed key out of active also
+		// keeps the prev == backendAddr short-circuit above from stranding it:
+		// the next cycle registers it again.
 		if err := w.reg.Register(key, &defForRegister, backend.host); err != nil {
-			w.logger.Error("Register failed", "key", key, "err", err)
+			w.noteRegisterFailure(key, err)
 			continue
 		}
+		delete(w.failed, key)
 		w.active[key] = backendAddr
 	}
 }
 
+// noteRegisterFailure logs a failed registration at Warn the first time it
+// happens, and at Debug while it keeps failing the same way across cycles, so a
+// permanently refused or unlistenable backend does not produce a Warn line
+// every poll interval. A key whose failure changes — a refused conflict that
+// becomes a listen failure, say — is a different outcome and gets its own Warn,
+// so the demotion cannot hide it.
+func (w *Watcher) noteRegisterFailure(key string, err error) {
+	msg := err.Error()
+	if prev, failing := w.failed[key]; failing && prev == msg {
+		w.logger.Debug("registration still failing; will retry next cycle", "key", key, "err", err)
+	} else {
+		w.logger.Warn("registration failed; will retry next cycle", "key", key, "err", err)
+	}
+	w.failed[key] = msg
+}
+
 // removeMissing deregisters any active key that wasn't seen in the latest
-// cycle.
+// cycle, and forgets the failure state of keys that are no longer seen at all.
 func (w *Watcher) removeMissing(seen map[string]struct{}) {
 	for key := range w.active {
 		if _, ok := seen[key]; !ok {
 			w.reg.Deregister(key)
 			delete(w.active, key)
+		}
+	}
+	for key := range w.failed {
+		if _, ok := seen[key]; !ok {
+			delete(w.failed, key)
 		}
 	}
 }

@@ -1,10 +1,12 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
@@ -417,5 +419,43 @@ func TestShort(t *testing.T) {
 		if got := short(tc.in); got != tc.want {
 			t.Errorf("short(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// A refused or failed Register in Docker mode is logged at Warn — not Error —
+// and the container is registered again on its next start event, since Docker
+// discovery has no reconciliation loop.
+func TestHandleEvent_RegisterFailureWarnsAndRetriesOnNextStart(t *testing.T) {
+	enabled := map[string]string{
+		"tsserve.enable":  "true",
+		"tsserve.service": "svc:web",
+		"tsserve.port":    "80",
+	}
+	api := &fakeDocker{
+		inspectByID: map[string]container.InspectResponse{
+			"cid1": inspectWithIP(map[string]string{"bridge": "172.17.0.10"}, enabled),
+		},
+	}
+	reg := &fakeRegistrar{registerErr: errors.New("backend cid1 refused for service svc:web: scheme conflict")}
+
+	var buf bytes.Buffer
+	w := newTestWatcher(api, reg)
+	w.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	start := events.Message{Action: events.ActionStart, Actor: events.Actor{ID: "cid1"}}
+	w.handleEvent(context.Background(), start)
+
+	out := buf.String()
+	if n := strings.Count(out, "level=ERROR"); n != 0 {
+		t.Errorf("ERROR lines = %d, want 0\n--- log ---\n%s", n, out)
+	}
+	if n := strings.Count(out, "level=WARN"); n != 1 {
+		t.Errorf("WARN lines = %d, want 1\n--- log ---\n%s", n, out)
+	}
+
+	// The container's next start event registers it again.
+	w.handleEvent(context.Background(), start)
+	if n := len(reg.regs()); n != 2 {
+		t.Errorf("Register calls = %d, want 2 (retried on the next start event)", n)
 	}
 }

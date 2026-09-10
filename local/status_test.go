@@ -70,41 +70,80 @@ func TestRowsFor_MapsServiceFields(t *testing.T) {
 	now := time.Now()
 	rows := rowsFor([]proxy.ServiceView{
 		{
-			Service:      "svc:web",
-			Backend:      "http://10.0.0.1:80",
-			Caps:         []string{"example.com/cap/read"},
-			ContainerID:  "abcdef1234567890",
-			RegisteredAt: now.Add(-5 * time.Second),
+			Service: "svc:web",
+			Scheme:  "http",
+			Caps:    []string{"example.com/cap/read"},
+			Backends: []proxy.BackendView{{
+				Backend:      "http://10.0.0.1:80",
+				Key:          "abcdef1234567890",
+				RegisteredAt: now.Add(-5 * time.Second),
+			}},
 		},
 	})
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
 	}
 	r := rows[0]
-	if r.Service != "svc:web" || r.Backend != "http://10.0.0.1:80" {
+	if r.Service != "svc:web" {
 		t.Errorf("row = %+v", r)
 	}
 	if len(r.Caps) != 1 || r.Caps[0] != "example.com/cap/read" {
 		t.Errorf("caps wrong: %+v", r)
 	}
-	if r.ContainerShort != "abcdef123456" {
-		t.Errorf("ContainerShort = %q", r.ContainerShort)
+	if len(r.Backends) != 1 {
+		t.Fatalf("backends = %d, want 1: %+v", len(r.Backends), r.Backends)
 	}
-	if !strings.HasSuffix(r.RegisteredAgo, " ago") {
-		t.Errorf("RegisteredAgo = %q, want suffix ' ago'", r.RegisteredAgo)
+	b := r.Backends[0]
+	if b.Backend != "http://10.0.0.1:80" {
+		t.Errorf("Backend = %q", b.Backend)
+	}
+	if b.ContainerShort != "abcdef123456" {
+		t.Errorf("ContainerShort = %q", b.ContainerShort)
+	}
+	if !strings.HasSuffix(b.RegisteredAgo, " ago") {
+		t.Errorf("RegisteredAgo = %q, want suffix ' ago'", b.RegisteredAgo)
 	}
 }
 
-func TestRowsFor_IncludesOrigin(t *testing.T) {
+// Account and Cluster come from each backend's own Origin, so a pool whose
+// members were found by different readers reports them correctly per row.
+func TestRowsFor_IncludesOriginPerBackend(t *testing.T) {
 	rows := rowsFor([]proxy.ServiceView{{
-		Service:      "svc:web",
-		Backend:      "http://10.0.0.1:80",
-		ContainerID:  "abc",
-		RegisteredAt: time.Now(),
-		Origin:       proxy.Origin{Account: "077542728448", Cluster: "border"},
+		Service: "svc:web",
+		Scheme:  "http",
+		Backends: []proxy.BackendView{
+			{
+				Backend:      "http://10.0.0.1:80",
+				Key:          "abc",
+				RegisteredAt: time.Now(),
+				Origin:       proxy.Origin{Account: "111111111111", Cluster: "cluster-a"},
+			},
+			{
+				Backend:      "http://10.1.0.1:80",
+				Key:          "def",
+				RegisteredAt: time.Now(),
+				Origin:       proxy.Origin{Account: "222222222222", Cluster: "cluster-b"},
+			},
+			{
+				// Docker discovery leaves Origin zero.
+				Backend:      "http://172.17.0.2:80",
+				Key:          "ghi",
+				RegisteredAt: time.Now(),
+			},
+		},
 	}})
-	if rows[0].Account != "077542728448" || rows[0].Cluster != "border" {
-		t.Errorf("origin not mapped onto row: %+v", rows[0])
+	if len(rows) != 1 || len(rows[0].Backends) != 3 {
+		t.Fatalf("rows = %+v, want 1 service with 3 backends", rows)
+	}
+	got := rows[0].Backends
+	if got[0].Account != "111111111111" || got[0].Cluster != "cluster-a" {
+		t.Errorf("backend[0] origin = %+v", got[0])
+	}
+	if got[1].Account != "222222222222" || got[1].Cluster != "cluster-b" {
+		t.Errorf("backend[1] origin = %+v", got[1])
+	}
+	if got[2].Account != "" || got[2].Cluster != "" {
+		t.Errorf("backend[2] origin = %+v, want empty for Docker discovery", got[2])
 	}
 }
 
@@ -210,21 +249,39 @@ func TestStatusHandler_EmptyServices(t *testing.T) {
 	}
 }
 
+// Two services — one with a single backend, one with two backends found by
+// different readers — render as a Services (2) heading, every backend address,
+// and both readers' accounts.
 func TestStatusHandler_RendersServicesTable(t *testing.T) {
 	now := time.Now()
 	snap := &fakeSnapshotter{services: []proxy.ServiceView{
 		{
-			Service:      "svc:web",
-			Backend:      "http://10.0.0.1:80",
-			ContainerID:  "abcdef1234567890",
-			RegisteredAt: now.Add(-30 * time.Second),
+			Service: "svc:web",
+			Scheme:  "http",
+			Backends: []proxy.BackendView{{
+				Backend:      "http://10.0.0.1:80",
+				Key:          "abcdef1234567890",
+				RegisteredAt: now.Add(-30 * time.Second),
+			}},
 		},
 		{
-			Service:      "svc:api",
-			Backend:      "https://10.0.0.2:3000",
-			Caps:         []string{"example.com/cap/admin"},
-			ContainerID:  "deadbeef0000",
-			RegisteredAt: now.Add(-90 * time.Second),
+			Service: "svc:api",
+			Scheme:  "https",
+			Caps:    []string{"example.com/cap/admin"},
+			Backends: []proxy.BackendView{
+				{
+					Backend:      "https://10.0.0.2:3000",
+					Key:          "deadbeef0000",
+					RegisteredAt: now.Add(-90 * time.Second),
+					Origin:       proxy.Origin{Account: "111111111111", Cluster: "cluster-a"},
+				},
+				{
+					Backend:      "https://10.9.0.7:3000",
+					Key:          "feedface1111",
+					RegisteredAt: now.Add(-20 * time.Second),
+					Origin:       proxy.Origin{Account: "222222222222", Cluster: "cluster-b"},
+				},
+			},
 		},
 	}}
 	s := newTestServer(snap)
@@ -239,14 +296,29 @@ func TestStatusHandler_RendersServicesTable(t *testing.T) {
 		"svc:api",
 		"http://10.0.0.1:80",
 		"https://10.0.0.2:3000",
+		"https://10.9.0.7:3000",
 		"example.com/cap/admin",
 		"abcdef123456", // shortID truncates
 		"deadbeef0000",
-		"Services (2)",
+		"feedface1111",
+		"111111111111",
+		"222222222222",
+		"Services (2)", // the heading counts advertised services, not backends
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
 		}
+	}
+	// The service and caps cells span their backend group, so a two-backend
+	// service names its service once.
+	if n := strings.Count(body, ">svc:api<"); n != 1 {
+		t.Errorf("svc:api rendered %d times, want 1 spanning cell", n)
+	}
+	if n := strings.Count(body, `rowspan="2"`); n != 2 {
+		t.Errorf("rowspan=\"2\" appears %d times, want 2 (Service and Caps span the pool)\n--- body ---\n%s", n, body)
+	}
+	if n := strings.Count(body, `rowspan="1"`); n != 2 {
+		t.Errorf("rowspan=\"1\" appears %d times, want 2 for the single-backend service", n)
 	}
 }
 

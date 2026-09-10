@@ -7,11 +7,15 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
 
@@ -26,8 +30,43 @@ type FatalError struct{ err error }
 func (e *FatalError) Error() string { return e.err.Error() }
 func (e *FatalError) Unwrap() error { return e.err }
 
-// Manager owns the tsnet.Server and the live set of Tailscale Service
-// listeners and reverse proxies. It is safe for concurrent use.
+// ConflictError is returned by [Manager.Register] when a backend's
+// service-level labels disagree with the service that is already advertised
+// under that name. The backend is refused: it joins no pool and is recorded
+// nowhere in the manager. Callers can distinguish it from a listen failure and
+// log it as a misconfiguration.
+//
+// Scheme and caps are properties of the advertised service — caps in
+// particular are fixed when the listener opens, since tsnet takes them as part
+// of the ServiceMode — so pool members must agree on both to be
+// interchangeable. The backend port is deliberately not compared: in ECS
+// bridge mode each task is assigned its own dynamic host port.
+type ConflictError struct {
+	Service string
+	// Key is the refused registration key.
+	Key string
+	// Field names the label that differs ("scheme" or "caps").
+	Field string
+	// Advertised is the advertised service's value, Offered the refused
+	// backend's.
+	Advertised string
+	Offered    string
+}
+
+func (e *ConflictError) Error() string {
+	// The full key, not short(): an ECS key is "<taskArn>#<containerName>", and
+	// shortening it keeps only a slice of the task ID, dropping the container
+	// name that says which of a task's containers was refused.
+	return fmt.Sprintf("backend %s refused for service %s: %s=%q conflicts with the advertised service's %s=%q",
+		e.Key, e.Service, e.Field, e.Offered, e.Field, e.Advertised)
+}
+
+// errShuttingDown is returned by Register once Close has run.
+var errShuttingDown = errors.New("manager is shutting down")
+
+// Manager owns the tsnet.Server and the live set of advertised Tailscale
+// Services, each with its backend pool and reverse proxy. It is safe for
+// concurrent use.
 type Manager struct {
 	// listenSvc opens a Tailscale Service listener. In production this calls
 	// (*tsnet.Server).ListenService; tests swap it for an in-memory listener
@@ -41,41 +80,62 @@ type Manager struct {
 	metrics *metrics.Collector
 
 	mu       sync.Mutex
-	byCID    map[string]*activeService // containerID -> service
-	byName   map[string]string         // serviceName -> containerID (winner)
+	services map[string]*advertisedService // service name -> advertised service
+	byKey    map[string]string             // registration key -> service name
 	shutdown bool
 }
 
-type activeService struct {
-	def     defSnapshot
+// advertisedService is one Tailscale Service tsserve holds a listener for,
+// together with the pool of backends serving it. The listener, the HTTP server
+// and the reverse proxy are created once, when the service is first
+// advertised, and shared by every backend that joins afterwards.
+type advertisedService struct {
+	name string
+	// scheme and caps are fixed by the registration that opened the listener.
+	scheme string
+	caps   []string
+
+	pool *backendPool
+
+	// A record is in exactly one of three states, all guarded by Manager.mu, and
+	// a Register that finds the name occupied waits for whichever transition is
+	// in flight rather than opening a second listener for it:
+	//
+	//	advertising  ready == false            -> wait on advertised
+	//	serving      ready == true             -> join the pool
+	//	withdrawing  withdrawing != nil        -> wait on withdrawing
+	//
+	// Both waits matter to correctness. tsnet refuses ListenService while a
+	// handler for the service's port is still in the serve config, so a Register
+	// that opened a listener before the outgoing one had finished closing would
+	// fail outright, leaving the service dark until discovery came round again.
+	ready bool
+	// advertised is closed once the ListenService call has finished, whether it
+	// succeeded or not.
+	advertised chan struct{}
+	// withdrawing is created when the last backend leaves and closed once the
+	// listener is shut and the record has left the service index.
+	withdrawing chan struct{}
+
 	cancel  context.CancelFunc
 	closeFn func() error
 }
 
-// defSnapshot is the immutable per-service state we need to render the status
-// page and clean up at deregistration time.
-type defSnapshot struct {
-	Service      string
-	Backend      string // "scheme://ip:port"
-	Scheme       string
-	BackendHost  string
-	Port         uint16
-	Caps         []string
-	ContainerID  string
-	RegisteredAt time.Time
-	Origin       Origin
-}
-
-// ServiceView is a defensive copy of an active service's state, returned by
+// ServiceView is a defensive copy of an advertised service's state, returned by
 // [Manager.Snapshot] for read-only consumers (e.g. the status page).
 type ServiceView struct {
-	Service      string
-	Backend      string
-	Scheme       string
-	BackendHost  string
-	Port         uint16
-	Caps         []string
-	ContainerID  string
+	Service  string
+	Scheme   string
+	Caps     []string
+	Backends []BackendView
+}
+
+// BackendView is one member of an advertised service's backend pool.
+type BackendView struct {
+	// Backend is the full address a request is proxied to, "scheme://host:port".
+	Backend string
+	// Key is the watcher-supplied registration key.
+	Key          string
 	RegisteredAt time.Time
 	Origin       Origin
 }
@@ -89,10 +149,10 @@ func NewManager(srv *tsnet.Server, lc *local.Client, logger *slog.Logger, mc *me
 		listenSvc: func(name string, mode tsnet.ServiceMode) (net.Listener, error) {
 			return srv.ListenService(name, mode)
 		},
-		logger:  logger,
-		metrics: mc,
-		byCID:   map[string]*activeService{},
-		byName:  map[string]string{},
+		logger:   logger,
+		metrics:  mc,
+		services: map[string]*advertisedService{},
+		byKey:    map[string]string{},
 	}
 	if lc != nil {
 		m.whois = lc.WhoIs
@@ -122,160 +182,338 @@ type Origin struct {
 	Region  string
 }
 
-// Register provisions a Tailscale Service listener for def and begins serving
-// reverse-proxied traffic to backendIP:def.Port. It is idempotent over the
-// (containerID, serviceName) pair: callers may safely call it repeatedly.
-func (m *Manager) Register(containerID string, def *ServiceDef, backendIP string) error {
-	m.mu.Lock()
-	if m.shutdown {
-		m.mu.Unlock()
-		return errors.New("manager is shutting down")
+// Register adds backendIP:def.Port to the backend pool of def.Service,
+// advertising the service (opening its Tailscale Service listener) if this is
+// its first backend. It is idempotent over the registration key: repeat calls
+// for a key already in a pool are a no-op.
+//
+// A nil return means the backend is a member of the pool of a service with an
+// open listener. Every other outcome returns an error: a *FatalError for a
+// configuration problem the caller should exit on, a *ConflictError when the
+// backend's labels disagree with the advertised service, and a plain error when
+// the listener could not be opened. Callers are expected to retry the latter
+// two on their next discovery cycle rather than record the backend as active.
+func (m *Manager) Register(key string, def *ServiceDef, backendIP string) error {
+	b := &backend{
+		key:          key,
+		addr:         net.JoinHostPort(backendIP, strconv.Itoa(int(def.Port))),
+		registeredAt: time.Now(),
+		origin:       def.Origin,
 	}
-	if _, exists := m.byCID[containerID]; exists {
+
+	for {
+		m.mu.Lock()
+		if m.shutdown {
+			m.mu.Unlock()
+			return errShuttingDown
+		}
+		if _, exists := m.byKey[key]; exists {
+			m.mu.Unlock()
+			return nil // already a pool member
+		}
+
+		rec, occupied := m.services[def.Service]
+		if !occupied {
+			// First backend for this name: claim it before releasing the lock so
+			// a concurrent Register waits for our listener instead of opening a
+			// second one.
+			rec = &advertisedService{
+				name:       def.Service,
+				scheme:     def.Scheme,
+				caps:       append([]string(nil), def.Caps...),
+				pool:       newBackendPool(),
+				advertised: make(chan struct{}),
+			}
+			m.services[def.Service] = rec
+			m.mu.Unlock()
+			return m.advertise(rec, key, b)
+		}
+
+		// The name is occupied by a transition in flight; wait for it and
+		// re-evaluate. On a successful advertise we join the new pool; after a
+		// failed advertise or a completed withdrawal the record is gone and we
+		// become the advertiser.
+		if wait := rec.transition(); wait != nil {
+			m.mu.Unlock()
+			<-wait
+			continue
+		}
+
+		if err := rec.conflictWith(key, def); err != nil {
+			m.mu.Unlock()
+			return err
+		}
+		size := rec.pool.add(b)
+		m.byKey[key] = rec.name
+		m.setPoolSize(rec.name, size)
 		m.mu.Unlock()
-		return nil // already registered
-	}
-	if owner, taken := m.byName[def.Service]; taken {
-		m.mu.Unlock()
-		m.logger.Warn("duplicate service name; ignoring",
-			"service", def.Service,
-			"holder", short(owner),
-			"duplicate", short(containerID))
+
+		m.logger.Info("backend joined service",
+			"service", rec.name,
+			"backend", backendURL(rec.scheme, b.addr),
+			"key", short(key),
+			"pool_size", size)
 		return nil
 	}
-	m.mu.Unlock()
+}
 
+// advertise opens the listener for a service claimed by this caller and starts
+// serving it with b as its first backend. On failure the claim is released so a
+// later registration can retry the name.
+func (m *Manager) advertise(rec *advertisedService, key string, b *backend) error {
 	mode := tsnet.ServiceModeHTTP{
 		HTTPS: true,
 		Port:  443,
 	}
-	if len(def.Caps) > 0 {
-		mode.AcceptAppCaps = map[string][]string{"/": def.Caps}
+	if len(rec.caps) > 0 {
+		mode.AcceptAppCaps = map[string][]string{"/": rec.caps}
 	}
 
-	ln, err := m.listenSvc(def.Service, mode)
+	ln, err := m.listenSvc(rec.name, mode)
 	if err != nil {
+		m.abandon(rec)
 		if isMagicDNSError(err) {
 			return &FatalError{err: fmt.Errorf(
 				"ListenService(%s) failed: %w: enable HTTPS Certificates and MagicDNS under DNS in the Tailscale admin console, and define the service under Services on TCP port 443",
-				def.Service, err)}
+				rec.name, err)}
 		}
-		m.logger.Error("ListenService failed; skipping container",
-			"service", def.Service, "container", short(containerID), "err", err)
-		return nil
+		return fmt.Errorf("ListenService(%s): %w", rec.name, err)
 	}
 
+	// Curry the service label once rather than resolving it per failed attempt,
+	// and keep the closure free of any reference to the manager or the record.
 	onError := func(reason string) {}
 	if m.metrics != nil {
-		onError = func(reason string) {
-			m.metrics.Errors.WithLabelValues(def.Service, reason).Inc()
-		}
+		errs := m.metrics.Errors.MustCurryWith(prometheus.Labels{"service": rec.name})
+		onError = func(reason string) { errs.WithLabelValues(reason).Inc() }
 	}
 
 	// Node-header injection rides on the same opt-in as app capabilities: when a
 	// service requests caps, tsserve also resolves the connecting peer and
 	// injects Tailscale-Node-Tags/Name for tagged nodes.
-	injectNode := len(def.Caps) > 0
-	var handler http.Handler = newReverseProxy(def.Scheme, backendIP, def.Port, m.logger, onError, injectNode, m.whois)
-	handler = m.metrics.Middleware(def.Service, handler)
+	injectNode := len(rec.caps) > 0
+	// Scope the proxy's logger to this service: its error lines have no single
+	// backend to name (an empty pool, a protocol upgrade that failed after the
+	// response began), so the service is what makes them attributable.
+	svcLogger := m.logger.With("service", rec.name)
+	rp := newReverseProxy(rec.scheme, rec.pool, svcLogger, onError, injectNode, m.whois)
+	var handler http.Handler = rp
+	handler = m.metrics.Middleware(rec.name, handler)
 
 	httpSrv := &http.Server{Handler: handler}
 	ctx, cancel := context.WithCancel(context.Background())
+
+	m.mu.Lock()
+	if m.shutdown {
+		m.releaseLocked(rec)
+		m.mu.Unlock()
+		cancel()
+		_ = httpSrv.Close()
+		closeIdleConns(rp)
+		_ = ln.Close()
+		return errShuttingDown
+	}
+	rec.cancel = cancel
+	rec.closeFn = func() error {
+		_ = httpSrv.Close()
+		// This service's transport is its own, so its keep-alive connections
+		// to the departed backends have no other user. Without this a service
+		// that is withdrawn and re-advertised — a replaced task, a Docker
+		// restart — leaves its idle sockets behind each time.
+		closeIdleConns(rp)
+		return ln.Close()
+	}
+	size := rec.pool.add(b)
+	rec.ready = true
+	close(rec.advertised)
+	m.byKey[key] = rec.name
+	m.serviceAdvertised(rec.name, size)
+	m.mu.Unlock()
 
 	go func() {
 		// http.Serve on the tsnet ServiceListener: TLS is already terminated
 		// inside the listener, so this is plain http.Serve.
 		err := httpSrv.Serve(ln)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) && ctx.Err() == nil {
-			m.logger.Warn("service http.Serve returned", "service", def.Service, "err", err)
+			m.logger.Warn("service http.Serve returned", "service", rec.name, "err", err)
 		}
 	}()
 
-	snap := defSnapshot{
-		Service:      def.Service,
-		Backend:      fmt.Sprintf("%s://%s:%d", def.Scheme, backendIP, def.Port),
-		Scheme:       def.Scheme,
-		BackendHost:  backendIP,
-		Port:         def.Port,
-		Caps:         append([]string(nil), def.Caps...),
-		ContainerID:  containerID,
-		RegisteredAt: time.Now(),
-		Origin:       def.Origin,
-	}
-
-	m.mu.Lock()
-	if m.shutdown {
-		m.mu.Unlock()
-		cancel()
-		_ = httpSrv.Close()
-		_ = ln.Close()
-		return errors.New("manager is shutting down")
-	}
-	m.byCID[containerID] = &activeService{
-		def:    snap,
-		cancel: cancel,
-		closeFn: func() error {
-			_ = httpSrv.Close()
-			return ln.Close()
-		},
-	}
-	m.byName[def.Service] = containerID
-	m.mu.Unlock()
-
-	if m.metrics != nil {
-		m.metrics.Active.Inc()
-	}
-
-	m.logger.Info("service registered",
-		"service", def.Service,
-		"backend", snap.Backend,
-		"caps", def.Caps,
-		"container", short(containerID))
+	m.logger.Info("service advertised",
+		"service", rec.name,
+		"backend", backendURL(rec.scheme, b.addr),
+		"caps", rec.caps,
+		"key", short(key),
+		"pool_size", size)
 	return nil
 }
 
-// Deregister tears down the listener and reverse proxy for the given
-// container, if one was registered. Calls with an unknown containerID are a
-// no-op.
-func (m *Manager) Deregister(containerID string) {
+// abandon releases a claim on a service name whose listener could not be
+// opened, waking any Register waiting on it.
+func (m *Manager) abandon(rec *advertisedService) {
 	m.mu.Lock()
-	svc, ok := m.byCID[containerID]
+	m.releaseLocked(rec)
+	m.mu.Unlock()
+}
+
+// closeIdleConns releases the idle connections held by a proxy's transport,
+// using the same interface check http.Client.CloseIdleConnections applies.
+func closeIdleConns(rp *httputil.ReverseProxy) {
+	if tr, ok := rp.Transport.(interface{ CloseIdleConnections() }); ok {
+		tr.CloseIdleConnections()
+	}
+}
+
+// releaseLocked drops rec from the service index (if it is still the record
+// held there) and wakes its waiters. Callers hold m.mu.
+func (m *Manager) releaseLocked(rec *advertisedService) {
+	if cur, ok := m.services[rec.name]; ok && cur == rec {
+		delete(m.services, rec.name)
+	}
+	if !rec.ready {
+		close(rec.advertised)
+	}
+}
+
+// transition returns the channel to wait on when this record is mid-advertise
+// or mid-withdrawal, and nil when it is serving and can be joined. Callers hold
+// m.mu.
+func (rec *advertisedService) transition() <-chan struct{} {
+	switch {
+	case rec.withdrawing != nil:
+		return rec.withdrawing
+	case !rec.ready:
+		return rec.advertised
+	default:
+		return nil
+	}
+}
+
+// conflictWith reports whether def's service-level labels disagree with the
+// already-advertised service. Callers hold m.mu.
+func (rec *advertisedService) conflictWith(key string, def *ServiceDef) error {
+	if def.Scheme != rec.scheme {
+		return &ConflictError{
+			Service: rec.name, Key: key, Field: "scheme",
+			Advertised: rec.scheme, Offered: def.Scheme,
+		}
+	}
+	if !sameCaps(rec.caps, def.Caps) {
+		return &ConflictError{
+			Service: rec.name, Key: key, Field: "caps",
+			Advertised: strings.Join(sortedCaps(rec.caps), ","),
+			Offered:    strings.Join(sortedCaps(def.Caps), ","),
+		}
+	}
+	return nil
+}
+
+// sameCaps compares two capability lists as sets: order and repetition do not
+// make two backends of one service incompatible. Capability lists have a
+// handful of entries at most, so a scan beats building sets.
+func sameCaps(a, b []string) bool {
+	return capsSubset(a, b) && capsSubset(b, a)
+}
+
+func capsSubset(a, b []string) bool {
+	for _, c := range a {
+		if !slices.Contains(b, c) {
+			return false
+		}
+	}
+	return true
+}
+
+// sortedCaps renders a capability list in a stable order for error messages.
+func sortedCaps(caps []string) []string {
+	return slices.Sorted(slices.Values(caps))
+}
+
+// Deregister removes one backend from its service's pool. The listener and
+// HTTP server stay up — along with in-flight requests to other members — while
+// any backend remains; the service is torn down when its last backend leaves.
+// Calls with an unknown registration key are a no-op.
+func (m *Manager) Deregister(key string) {
+	m.mu.Lock()
+	name, ok := m.byKey[key]
 	if !ok {
 		m.mu.Unlock()
 		return
 	}
-	delete(m.byCID, containerID)
-	if owner, taken := m.byName[svc.def.Service]; taken && owner == containerID {
-		delete(m.byName, svc.def.Service)
+	delete(m.byKey, key)
+	rec, ok := m.services[name]
+	if !ok || !rec.ready {
+		// A key only reaches byKey once its service is serving, so this is
+		// unreachable; guard rather than trust it, since the teardown below
+		// calls cancel/closeFn, which a record that never finished advertising
+		// has not set.
+		m.mu.Unlock()
+		return
 	}
+	size := rec.pool.remove(key)
+	if size > 0 {
+		m.setPoolSize(name, size)
+		m.mu.Unlock()
+		m.logger.Info("backend left service", "service", name, "key", short(key), "pool_size", size)
+		return
+	}
+	// The pool is empty: mark the record withdrawing and keep it in the index
+	// while the listener closes. A Register arriving now waits on that channel
+	// rather than calling ListenService, which tsnet would refuse while this
+	// service's handler is still in the serve config.
+	rec.withdrawing = make(chan struct{})
 	m.mu.Unlock()
 
-	svc.cancel()
-	if err := svc.closeFn(); err != nil {
-		m.logger.Warn("error closing service listener", "service", svc.def.Service, "err", err)
+	rec.cancel()
+	if err := rec.closeFn(); err != nil {
+		m.logger.Warn("error closing service listener", "service", name, "err", err)
 	}
-	if m.metrics != nil {
-		m.metrics.Active.Dec()
+
+	m.mu.Lock()
+	if cur, ok := m.services[name]; ok && cur == rec {
+		delete(m.services, name)
+		// The gauges belong to whoever drops the record. A Close that ran
+		// while this teardown was in flight has already emptied the index and
+		// zeroed both gauges, and decrementing on top of that would leave
+		// tsserve_services_active at -1.
+		m.serviceWithdrawn(name)
 	}
-	m.logger.Info("service deregistered", "service", svc.def.Service, "container", short(containerID))
+	close(rec.withdrawing)
+	m.mu.Unlock()
+
+	m.logger.Info("service withdrawn; last backend left",
+		"service", name, "key", short(key), "pool_size", 0)
 }
 
-// Snapshot returns a defensive copy of the active service set, sorted by
-// service name. Intended for the status page and other read-only consumers.
+// Snapshot returns a defensive copy of the advertised service set, sorted by
+// service name, each with its backend pool in pool order. Intended for the
+// status page and other read-only consumers.
 func (m *Manager) Snapshot() []ServiceView {
 	m.mu.Lock()
-	out := make([]ServiceView, 0, len(m.byCID))
-	for _, s := range m.byCID {
+	out := make([]ServiceView, 0, len(m.services))
+	for _, rec := range m.services {
+		if !rec.ready || rec.withdrawing != nil {
+			// Either the listener is still being opened, or the pool has
+			// emptied and the record is only still here so a racing Register
+			// waits for the listener to close. Neither has a backend to show,
+			// and every ServiceView is meant to carry at least one.
+			continue
+		}
+		members := rec.pool.list()
+		backends := make([]BackendView, 0, len(members))
+		for _, b := range members {
+			backends = append(backends, BackendView{
+				Backend:      backendURL(rec.scheme, b.addr),
+				Key:          b.key,
+				RegisteredAt: b.registeredAt,
+				Origin:       b.origin,
+			})
+		}
 		out = append(out, ServiceView{
-			Service:      s.def.Service,
-			Backend:      s.def.Backend,
-			Scheme:       s.def.Scheme,
-			BackendHost:  s.def.BackendHost,
-			Port:         s.def.Port,
-			Caps:         append([]string(nil), s.def.Caps...),
-			ContainerID:  s.def.ContainerID,
-			RegisteredAt: s.def.RegisteredAt,
-			Origin:       s.def.Origin,
+			Service:  rec.name,
+			Scheme:   rec.scheme,
+			Caps:     append([]string(nil), rec.caps...),
+			Backends: backends,
 		})
 	}
 	m.mu.Unlock()
@@ -283,26 +521,70 @@ func (m *Manager) Snapshot() []ServiceView {
 	return out
 }
 
-// Close tears down all active services. It is safe to call once.
+// Close tears down every advertised service exactly once. It is safe to call
+// once.
 func (m *Manager) Close() {
 	m.mu.Lock()
 	m.shutdown = true
-	services := make([]*activeService, 0, len(m.byCID))
-	for _, s := range m.byCID {
-		services = append(services, s)
-	}
-	m.byCID = map[string]*activeService{}
-	m.byName = map[string]string{}
-	m.mu.Unlock()
-
-	for _, s := range services {
-		s.cancel()
-		if err := s.closeFn(); err != nil {
-			m.logger.Warn("error closing service on shutdown", "service", s.def.Service, "err", err)
+	recs := make([]*advertisedService, 0, len(m.services))
+	for _, rec := range m.services {
+		// Records still inside ListenService tear themselves down when they see
+		// the shutdown flag, and a withdrawing one is already being torn down
+		// by the Deregister that emptied its pool. Closing either here would
+		// run cancel/closeFn a second time, concurrently with the first.
+		if rec.ready && rec.withdrawing == nil {
+			recs = append(recs, rec)
 		}
 	}
+	m.services = map[string]*advertisedService{}
+	m.byKey = map[string]string{}
+	m.allServicesWithdrawn()
+	m.mu.Unlock()
+
+	for _, rec := range recs {
+		rec.cancel()
+		if err := rec.closeFn(); err != nil {
+			m.logger.Warn("error closing service on shutdown", "service", rec.name, "err", err)
+		}
+	}
+}
+
+// The gauges below are pure functions of the advertised-service set. Every
+// path that changes that set goes through exactly one of these, so a new path
+// cannot leave a stale series behind. Each is a no-op when no collector is
+// wired.
+
+// setPoolSize publishes a service's current pool size.
+func (m *Manager) setPoolSize(service string, n int) {
+	if m.metrics != nil {
+		m.metrics.Backends.WithLabelValues(service).Set(float64(n))
+	}
+}
+
+// serviceAdvertised records a service whose listener has just opened, with its
+// initial pool size.
+func (m *Manager) serviceAdvertised(service string, n int) {
+	if m.metrics != nil {
+		m.metrics.Active.Inc()
+	}
+	m.setPoolSize(service, n)
+}
+
+// serviceWithdrawn records a service whose last backend has left. Its pool-size
+// series is deleted rather than zeroed, so the exposition does not keep a value
+// for a service that no longer exists.
+func (m *Manager) serviceWithdrawn(service string) {
+	if m.metrics != nil {
+		m.metrics.Active.Dec()
+		m.metrics.Backends.DeleteLabelValues(service)
+	}
+}
+
+// allServicesWithdrawn clears both gauges on shutdown.
+func (m *Manager) allServicesWithdrawn() {
 	if m.metrics != nil {
 		m.metrics.Active.Set(0)
+		m.metrics.Backends.Reset()
 	}
 }
 

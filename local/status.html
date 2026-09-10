@@ -90,16 +90,18 @@
       <tr><th>Service</th><th>Backend</th><th>Caps</th><th>Account</th><th>Cluster</th><th>Container</th><th>Registered</th></tr>
     </thead>
     <tbody>
-      {{range .Services}}
+      {{range $svc := .Services}}
+      {{range $i, $b := $svc.Backends}}
       <tr>
-        <td class="mono">{{.Service}}</td>
-        <td class="mono">{{.Backend}}</td>
-        <td>{{if .Caps}}<span class="mono">{{range $i, $c := .Caps}}{{if $i}}, {{end}}{{$c}}{{end}}</span>{{else}}<span class="empty">—</span>{{end}}</td>
-        <td class="mono">{{if .Account}}{{.Account}}{{else}}<span class="empty">—</span>{{end}}</td>
-        <td class="mono">{{if .Cluster}}{{.Cluster}}{{else}}<span class="empty">—</span>{{end}}</td>
-        <td class="mono">{{.ContainerShort}}</td>
-        <td>{{.RegisteredAgo}}</td>
+        {{if eq $i 0}}<td class="mono" rowspan="{{len $svc.Backends}}">{{$svc.Service}}</td>{{end}}
+        <td class="mono">{{$b.Backend}}</td>
+        {{if eq $i 0}}<td rowspan="{{len $svc.Backends}}">{{if $svc.Caps}}<span class="mono">{{range $j, $c := $svc.Caps}}{{if $j}}, {{end}}{{$c}}{{end}}</span>{{else}}<span class="empty">—</span>{{end}}</td>{{end}}
+        <td class="mono">{{if $b.Account}}{{$b.Account}}{{else}}<span class="empty">—</span>{{end}}</td>
+        <td class="mono">{{if $b.Cluster}}{{$b.Cluster}}{{else}}<span class="empty">—</span>{{end}}</td>
+        <td class="mono">{{$b.ContainerShort}}</td>
+        <td>{{$b.RegisteredAgo}}</td>
       </tr>
+      {{end}}
       {{end}}
     </tbody>
   </table>

@@ -530,10 +530,6 @@ The proxy itself can run as a small ECS task in the border VPC, using workload i
 
 The proxy task role (`tsserve-proxy`) carries both the Tailscale workload identity federation subject claim and the AWS IAM permissions listed above. No static credentials anywhere.
 
-### Known v1 limitations
-
-- **Replica fan-out is not supported.** If an ECS service runs N replicas of a task definition that declares `tsserve.service=svc:api`, only the first task discovered will back the service; the others are logged as duplicates and ignored (consistent with `proxy.Manager`'s existing "first wins" behaviour — see `proxy/manager.go:86`). For services that need load-balanced fan-out, run an internal NLB or ALB in the ECS VPC and label a single "shim" task that forwards to it. See [Future Extensions](#future-extensions-out-of-scope-for-v1).
-
 ---
 
 ## Core Components
@@ -549,11 +545,13 @@ Connects to the Docker daemon via the Docker socket and monitors container lifec
 - Subscribe to Docker events. React to `start`, `die`, and `stop` events.
 - For each qualifying container, resolve its IP on the configured Docker network.
 - Pass discovered service definitions to the Service Manager.
+- Two or more containers sharing a `tsserve.service` label both serve it: each joins that service's backend pool, keyed by its container ID.
 
 **Implementation notes:**
 - Use the `github.com/docker/docker/client` Go SDK.
 - Filter events to container types only.
 - When a container starts, wait briefly (e.g. 1s) for its network to be ready before resolving its IP.
+- Docker discovery is purely event-driven: there is no reconciliation loop. A container whose registration failed or was refused for a conflict is logged at Warn and rejoins only on its own next start event — not when the conflicting member later dies.
 
 ### 1b. ECS Watcher (`TSSERVE_DISCOVERY=ecs`)
 
@@ -572,44 +570,55 @@ Queries the AWS ECS API on a fixed interval and drives the same `Registrar` inte
 - Cache container-instance → EC2 instance ID → private IP mappings; refresh on miss.
 - Skip tasks that lack `tsserve.enable=true`. Skip tasks that haven't reached `lastStatus=RUNNING`.
 - When a task definition declares multiple containers with `tsserve.enable=true`, treat each (taskArn, containerName) pair as a separate registration. Use a composite registration key like `taskArn#containerName`.
+- Tasks sharing a `tsserve.service` value all back that service: replicas of one ECS service, containers of different ECS services, and tasks found by different readers (different accounts or clusters) are all members of the same backend pool.
+- Only record a registration key as active once `Register` reports the backend is serving. A key whose registration failed or was refused is retried on every subsequent cycle while its task is still seen, and logged at Warn once per distinct failure rather than once per poll interval.
 - Handle ECS API throttling: SDK retries with exponential backoff are sufficient at expected scales (a few `Describe*` calls per poll cycle).
 
 ### 2. Service Manager
 
 Owns the `tsnet.Server` instance and manages the mapping from Tailscale services to active listeners.
 
+A **backend** is one discovered endpoint (host and port) that can serve a service; the watcher-supplied **registration key** identifies it (a Docker container ID, or `taskArn#containerName` in ECS). An **advertised service** is a Tailscale Service tsserve holds an open `ListenService` listener for, and its **backend pool** is the ordered set of backends currently registered against it. Scheme and caps are properties of the advertised service, not of any one backend.
+
 **Responsibilities:**
-- Maintain a map of `containerID → *activeService` where `activeService` holds the `ServiceListener`, a cancel function, and the running reverse proxy.
-- When the Docker Watcher reports a new container:
+- Maintain a map of `serviceName → advertised service`, each owning its `ServiceListener`, `http.Server`, reverse proxy, cancel function and backend pool, plus an index from registration key to service name.
+- When a watcher reports a backend for a service that is **not yet advertised**:
   1. Build the `ServiceModeHTTP` config: always `HTTPS: true, Port: 443`. If `tsserve.caps` is set, parse the comma-separated capability names and set `AcceptAppCaps: map[string][]string{"/": caps}`.
   2. Call `tsnet.Server.ListenService(serviceName, mode)`. This tells tsnet to listen for HTTPS connections and automatically provision a TLS certificate from Let's Encrypt for the service's FQDN.
-  3. Create an `httputil.ReverseProxy` targeting the container's IP and port.
+  3. Create one `httputil.ReverseProxy` for the service, reading its backend pool per request.
   4. Serve HTTP on the returned `ServiceListener` in a goroutine. Note: despite calling `http.Serve` (not `http.ServeTLS`), TLS is handled by tsnet's listener — the `ServiceListener` already terminates TLS before handing the request to the handler.
-  5. Store the active service in the map.
-- When the Docker Watcher reports a container has stopped:
-  1. Look up the active service by container ID.
-  2. Close the `ServiceListener` (this stops accepting new connections).
-  3. Remove the entry from the map.
+  5. Put the backend in the pool and record the advertised service.
+- When a watcher reports a backend for a service that **is** advertised: add it to that service's pool. `ListenService` is called once per advertised service, never once per backend. Every backend carrying the label joins the pool regardless of provenance — several tasks of one ECS service, tasks of different ECS services, tasks found by different readers, and Docker containers.
+- **Conflict rule.** A backend whose `tsserve.scheme` differs from the advertised service's, or whose `tsserve.caps` differ from it as a set, is refused: it joins no pool and is recorded nowhere. Caps in particular cannot vary, because tsnet fixes them when the listener opens. The backend port is *not* compared — in ECS bridge mode each task has its own dynamic host port, which is exactly the shape a pool exists to serve. Once the pool empties, the next registration (including a previously refused one) advertises the service afresh with its own scheme and caps.
+- When a watcher reports a backend has gone:
+  1. Look up its service by registration key and remove that backend from the pool. The listener, the HTTP server and in-flight requests to other members are untouched.
+  2. When the pool is now empty, close the `ServiceListener` (this stops accepting new connections) and drop the advertised service. The name is free for a fresh registration afterwards.
+- **Register return contract.** Return "registered" only when the backend is a member of the pool of a service with an open listener. A refused conflict and a non-fatal `ListenService` failure both return an error the caller can tell apart, so a watcher never records a backend as active with nothing serving it. See [Error Handling](#error-handling) for what each watcher does with that error.
 
 **Implementation notes:**
 - `ListenService` can be called multiple times on the same `tsnet.Server` for different services — this is the core of how one node hosts many services.
-- Use a `sync.Mutex` or similar to protect the map since Docker events arrive asynchronously.
+- Use a `sync.Mutex` or similar to protect the service map, since events arrive asynchronously and several ECS readers can register against one service name concurrently. A registration that finds the name occupied by a transition already in flight — a listener being opened, or one being closed after the last backend left — must wait for that transition rather than act on its own. `ListenService` is refused while a handler for the service's port is still in the serve config, so a registration that opened a listener before the outgoing one had finished closing would fail outright and leave the service dark until discovery came round again.
+- Serving a request must never wait on a `ListenService` call or a listener teardown. Discovery writes a pool at most once per task or container change while the request path reads it on every request, so the pool is published copy-on-write and read without a lock.
 - Use `context.Context` cancellation for clean goroutine shutdown.
 
 ### 3. Reverse Proxy
 
-A standard Go `net/http/httputil.ReverseProxy` per service.
+One Go `net/http/httputil.ReverseProxy` per advertised service, shared by every backend in its pool.
 
 **Responsibilities:**
-- Forward requests to the backend container IP + port.
-- Set `X-Forwarded-For`, `X-Forwarded-Proto` headers (Go's ReverseProxy does `X-Forwarded-For` by default).
+- Forward each request to a backend chosen from the service's pool, round-robin in pool order. The rotation advances once per request. A backend added to the pool starts receiving requests on the next request; one removed receives no further requests. No proxy is built per backend or per request.
+- **Retry rule.** When an attempt fails *before the request was written to the backend* (dial refused, dial timeout, no route, DNS failure, TLS handshake failure) and the request carries no body, try the remaining pool members in rotation order, at most once each, and return the first successful response. In every other case — a failure after the request was written, or a request carrying a body — there is no retry and the client gets a 502. Retrying is done at the `RoundTrip` boundary, where nothing has yet been written to the client, so it can never replay a request a backend has already acted on. Server requests have no rewindable body, which is why a request carrying one is never retried; clients needing that reliability retry themselves.
+- Bound connection establishment to a few seconds (5s) for both `http` and `https` services, so a blackholed member costs a request one dial timeout rather than the Go default of 30s before the next member is tried.
+- Set `X-Forwarded-For`, `X-Forwarded-Proto` headers (Go's ReverseProxy does `X-Forwarded-For` by default). The outbound URL host and `Host` header name the backend that actually receives each attempt.
 - When the service has opted into `tsserve.caps`, inject [node identity headers](#node-identity-headers) (`Tailscale-Node-Tags`, `Tailscale-Node-Name`) for tagged peers, resolved via `LocalClient.WhoIs`, and strip any inbound copies of those headers first to prevent spoofing.
-- Log proxy errors.
+- Log proxy errors, naming the backend each failed attempt targeted.
 
 **Implementation notes:**
-- Use `httputil.NewSingleHostReverseProxy` as the base.
-- Override the `ErrorHandler` to log errors and return 502.
-- If `tsserve.scheme=https`, set the proxy target scheme to `https` and configure the transport to skip TLS verification (for self-signed backend certs).
+- Override the `ErrorHandler` to log errors and return 502. It is not the place to retry: it is also reached after a backend has returned `101 Switching Protocols`, and after the client connection has been hijacked.
+- Decide whether an attempt failed before the request was written from the error's type, not its text — string matching cannot tell a dial timeout from a read timeout on a request that was already sent.
+- If `tsserve.scheme=https`, set the proxy target scheme to `https` and configure the transport to skip TLS verification (for self-signed backend certs). The transport is shared by all pool members.
+- A hijacked (protocol-upgrade) connection stays bound to the backend that accepted it for its lifetime. Removing that backend from the pool does not close the connection; it ends when the backend does.
+- There are no health checks: a backend stays in the pool until discovery removes it, and per-request retry covers the window in between.
 
 ---
 
@@ -632,20 +641,20 @@ The "Container Start / Stop / Restart" subsections below describe Docker mode. T
 2. Inspect container for `tsserve.*` labels. Ignore if missing or `tsserve.enable != "true"`.
 3. Resolve container IP on the specified Docker network.
 4. Pass service definition to Service Manager.
-5. Service Manager calls `ListenService`, starts reverse proxy goroutine.
-6. Log: `"service registered: svc:web -> 172.17.0.3:80"`.
+5. If the service is not yet advertised, the Service Manager calls `ListenService` and starts the reverse proxy goroutine; otherwise the container joins the existing service's backend pool.
+6. Log: `"service advertised: svc:web -> 172.17.0.3:80"`, or `"backend joined service"` with the resulting pool size.
 
 ### Container Stop
 
 1. Docker Watcher receives `die` or `stop` event.
-2. Look up container ID in the Service Manager's active map.
-3. Close the `ServiceListener`. In-flight requests will complete; new connections are refused.
-4. Remove from map.
-5. Log: `"service deregistered: svc:web"`.
+2. Look up the container's service by registration key and remove it from that service's backend pool.
+3. If other backends remain, that is all: the listener stays open and requests keep being served by the rest of the pool.
+4. If the pool is now empty, close the `ServiceListener`. In-flight requests will complete; new connections are refused. Drop the advertised service.
+5. Log: `"backend left service"` with the resulting pool size, or `"service withdrawn; last backend left"`.
 
 ### Container IP Change (Restart)
 
-When a container restarts, Docker emits `die` then `start`. The stop handler tears down the old listener, and the start handler creates a new one with the new container IP. No special handling needed.
+When a container restarts, Docker emits `die` then `start`. The stop handler removes the old backend from the pool, and the start handler adds one with the new container IP. If it was the only backend, the listener is torn down and re-advertised, re-provisioning the service's certificate. No special handling needed.
 
 ### tsserve Shutdown
 
@@ -660,10 +669,10 @@ When a container restarts, Docker emits `die` then `start`. The stop handler tea
 
 | Scenario | Behaviour |
 |---|---|
-| `ListenService` fails (e.g. service not defined, node untagged) | Log error with service name. Do not crash. Skip this container. |
+| `ListenService` fails (e.g. service not defined, node untagged) | `Register` returns an error; the backend is not recorded as active. Do not crash. ECS logs it at Warn on the first failure (quiet while the same failure persists) and retries on the next poll cycle; Docker logs it at Warn and retries on the container's next start event. |
 | `ListenService` fails because HTTPS/MagicDNS not enabled | Fatal error on first occurrence. Exit with a clear message telling the user to enable HTTPS and MagicDNS in the admin console. |
 | Container IP cannot be resolved | Log warning. Skip this container. Retry on next Docker event for this container. |
-| Backend unreachable (container crashed but event not yet received) | Reverse proxy returns 502 to the client. Normal behaviour. |
+| Backend unreachable (container crashed but event not yet received) | The reverse proxy tries the remaining pool members when the request carries no body, and returns the first successful response. When every member fails, or the request carries a body, the client gets a 502. Normal behaviour. |
 | Docker socket unavailable at startup (Docker mode) | Fatal error. Exit with message. |
 | ECS `DescribeTasks` returns `AccessDeniedException` (ECS mode) | Fatal error on first occurrence. Exit with message naming the IAM action that was denied. |
 | ECS `TSSERVE_ECS_CLUSTER` does not exist (ECS mode) | Fatal error. Exit with message. |
@@ -672,7 +681,9 @@ When a container restarts, Docker emits `die` then `start`. The stop handler tea
 | awsvpc-mode task with no `ElasticNetworkInterface` attachment yet | Log debug message. Skip this poll. The next cycle will pick it up once the ENI is attached. |
 | `ec2:DescribeInstances` fails for a container instance (ECS mode) | Log warning. Skip this container. Cached host IPs are invalidated on failure so the next poll retries cleanly. |
 | `tsnet.Server.Start()` fails (e.g. bad auth key, OIDC token exchange failure, expired credentials) | Fatal error. Exit with message. For OIDC failures, suggest checking the federated identity configuration in the Tailscale admin console. |
-| Duplicate `tsserve.service` on two containers (Docker mode) or two tasks (ECS mode) | First one wins. Log a warning for the duplicate. If the first stops, the second does NOT auto-register (it would need to be restarted, or ECS mode would need to rediscover it on the next poll cycle). |
+| Same `tsserve.service` on two containers (Docker mode) or two tasks (ECS mode) | Both join the service's backend pool and both receive traffic. The service stays advertised while either remains. |
+| A backend's `tsserve.scheme` or `tsserve.caps` disagree with the advertised service | The backend is refused and not added to the pool; existing members keep serving. Logged at Warn by the watcher. Retried per the `ListenService` row above. |
+| Last pool member leaves before its replacement is discovered | The service is torn down and re-advertised when the replacement appears, re-provisioning its certificate. Within one ECS poll cycle the watcher registers new tasks before deregistering missing ones, so a replacement that is already RUNNING joins the pool before the old member leaves. |
 
 ---
 
@@ -813,8 +824,9 @@ All counters and gauges are prefixed `tsserve_`. Histograms use the default Prom
 | `tsserve_proxy_response_bytes_total` | Counter | `service` | Bytes written to response bodies (does not include response headers). After a hijack, also counts bytes written to the client over the upgraded connection. |
 | `tsserve_proxy_in_flight_requests` | Gauge | `service` | Currently executing handlers, by service. Includes open WebSocket connections (they block in the handler for their lifetime). |
 | `tsserve_proxy_open_websockets` | Gauge | `service` | Current open WebSocket (hijacked protocol-upgrade) connections, by service. |
-| `tsserve_proxy_backend_errors_total` | Counter | `service`, `reason` | Backend errors observed by the reverse proxy's `ErrorHandler`. `reason` is a coarse classification: `timeout`, `connection-refused`, `dns`, `eof`, `other`. |
-| `tsserve_services_active` | Gauge | — | Number of Tailscale Services currently registered. |
+| `tsserve_proxy_backend_errors_total` | Counter | `service`, `reason` | One increment per failed attempt against a backend, so a request retried against a second member contributes more than one. `reason` is a coarse classification: `timeout`, `connection-refused`, `dns`, `eof`, `no-backend`, `other`. |
+| `tsserve_services_active` | Gauge | — | Number of Tailscale Services currently advertised. Backends joining or leaving an advertised service do not change it. |
+| `tsserve_service_backends` | Gauge | `service` | Number of backends currently in an advertised service's pool. The series is removed when the service is torn down. |
 | `tsserve_build_info` | Gauge | `version`, `revision`, `go_version` (const) | Constant `1`. Useful for grouping in dashboards. |
 
 Standard `go_*` and `process_*` collectors are also registered.
@@ -976,7 +988,6 @@ These are explicitly not part of the initial implementation but noted for future
 - **Multiple services per container** — indexed labels like `tsserve.1.service`, `tsserve.1.port`.
 - **Path-scoped app capabilities** — allow per-path capability mounts (e.g. `tsserve.caps./foo=example.com/cap/foo`) instead of the current all-at-root approach.
 - **EventBridge-driven ECS updates** — subscribe to `ECS Task State Change` events via EventBridge → SQS for sub-second lifecycle reaction in cluster mode, instead of the v1 polling loop. Polling remains as a reconciliation fallback.
-- **ECS replica fan-out** — when multiple tasks share a `tsserve.service` value (e.g. an ECS service with `desiredCount > 1`), advertise the service once and load-balance requests across all healthy task backends, rather than the current "first task wins" behaviour. Likely involves extending `proxy.Manager` to hold a small per-service backend pool.
 - **Fargate launch-type support** — the ECS watcher's awsvpc code path already handles Fargate's task-IP shape, but Fargate has additional constraints (no container-instance ARN, no host-IP fallback, IAM via task role only) that need explicit testing and a documented setup path.
 
 ---

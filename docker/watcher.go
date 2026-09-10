@@ -136,7 +136,9 @@ func (w *Watcher) register(ctx context.Context, id string, def *labels.ServiceDe
 		return
 	}
 	if err := w.reg.Register(id, def, ip); err != nil {
-		w.logger.Error("service registration failed",
+		// Docker discovery is event-driven: there is no reconciliation loop, so
+		// this container rejoins the pool on its next start event.
+		w.logger.Warn("service registration failed; will retry on this container's next start event",
 			"container", short(id), "service", def.Service, "err", err)
 	}
 }
