@@ -1,0 +1,17 @@
+{
+	"name": "tsserve-${localWorkspaceFolderBasename}",
+	"image": "mcr.microsoft.com/devcontainers/base:ubuntu24.04",
+	"features": {
+		"ghcr.io/mkmba-nz/dev-infra/agent-manager:latest": {},
+		"ghcr.io/devcontainers/features/go:1": {
+			"version": "1.26"
+		},
+		"ghcr.io/mkmba-nz/dev-infra/go-proxy:latest": {},
+		"ghcr.io/mkmba-nz/dev-infra/pre-commit:latest": {}
+	},
+	"initializeCommand": "$HOME/infra/prebuilds/claude/.devcontainer/setup-network ${devcontainerId}",
+	"runArgs": [
+		"--network=${devcontainerId}_default",
+		"--add-host=host.docker.internal:host-gateway"
+	]
+}
