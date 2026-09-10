@@ -1,0 +1,9 @@
+# Normal rules.
+* @mattbnz
+
+# Allow doc commits without CODEOWNER approval (e.g. bot approvals!)
+# but still subject to all other approvals.
+/docs/**
+
+# Always last - Protect GitHub config explicitly
+/.github/ @mattbnz
