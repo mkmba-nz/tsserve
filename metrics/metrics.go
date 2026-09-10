@@ -32,6 +32,7 @@ type Collector struct {
 	WSOpen    *prometheus.GaugeVec
 	Errors    *prometheus.CounterVec
 	Active    prometheus.Gauge
+	Backends  *prometheus.GaugeVec
 }
 
 // New builds a Collector with a fresh registry, the standard go/process
@@ -68,17 +69,21 @@ func New() *Collector {
 		}, []string{"service"}),
 		Errors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tsserve_proxy_backend_errors_total",
-			Help: "Backend errors reported by the reverse proxy, by service and reason.",
+			Help: "Failed attempts against a backend, by service and reason. One increment per attempt, so a request retried against a second backend can contribute more than one.",
 		}, []string{"service", "reason"}),
 		Active: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "tsserve_services_active",
-			Help: "Number of Tailscale Services currently registered and serving.",
+			Help: "Number of Tailscale Services currently advertised and serving. Backends joining or leaving an advertised service do not change it.",
 		}),
+		Backends: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tsserve_service_backends",
+			Help: "Number of backends currently in an advertised service's pool, by service.",
+		}, []string{"service"}),
 	}
 
 	reg.MustRegister(
 		c.Requests, c.Duration, c.ReqBytes, c.RespBytes,
-		c.InFlight, c.WSOpen, c.Errors, c.Active,
+		c.InFlight, c.WSOpen, c.Errors, c.Active, c.Backends,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		buildInfo(),

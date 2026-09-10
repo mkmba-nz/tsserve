@@ -46,13 +46,21 @@ type tailnetView struct {
 	BackendState   string
 }
 
+// serviceRow is the status-page view of one advertised service. It renders as
+// a group of table rows, one per backend, with the service-level cells spanning
+// the group.
 type serviceRow struct {
-	Service        string
+	Service  string
+	Caps     []string
+	Backends []backendRow
+}
+
+// backendRow is one member of an advertised service's backend pool.
+type backendRow struct {
 	Backend        string
-	Caps           []string
 	ContainerShort string
 	RegisteredAgo  string
-	// Origin identifies the ECS reader (account + cluster) a service was
+	// Origin identifies the ECS reader (account + cluster) a backend was
 	// discovered from. Both are empty for Docker discovery.
 	Account string
 	Cluster string
@@ -137,14 +145,20 @@ func rowsFor(services []proxy.ServiceView) []serviceRow {
 	out := make([]serviceRow, 0, len(services))
 	now := time.Now()
 	for _, s := range services {
+		backends := make([]backendRow, 0, len(s.Backends))
+		for _, b := range s.Backends {
+			backends = append(backends, backendRow{
+				Backend:        b.Backend,
+				ContainerShort: shortID(b.Key),
+				RegisteredAgo:  humanDuration(now.Sub(b.RegisteredAt)) + " ago",
+				Account:        b.Origin.Account,
+				Cluster:        b.Origin.Cluster,
+			})
+		}
 		out = append(out, serviceRow{
-			Service:        s.Service,
-			Backend:        s.Backend,
-			Caps:           s.Caps,
-			ContainerShort: shortID(s.ContainerID),
-			RegisteredAgo:  humanDuration(now.Sub(s.RegisteredAt)) + " ago",
-			Account:        s.Origin.Account,
-			Cluster:        s.Origin.Cluster,
+			Service:  s.Service,
+			Caps:     s.Caps,
+			Backends: backends,
 		})
 	}
 	return out
