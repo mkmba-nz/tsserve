@@ -5,3 +5,6 @@
 .vscode/
 .idea/
 .DS_Store
+
+# Agent manager
+.agent-state.json
