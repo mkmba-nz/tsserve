@@ -79,6 +79,15 @@ type Manager struct {
 	logger  *slog.Logger
 	metrics *metrics.Collector
 
+	// serveMu serialises every call that mutates the node's serve config:
+	// opening a service listener, and closing one. tsnet applies those edits as
+	// a read-modify-write guarded by an ETag, so two of them in flight at once —
+	// two services advertising at start-up, an advertisement racing a withdrawal
+	// — make one of them fail with an etag mismatch, leaving a running backend
+	// unserved. Held strictly around the tsnet call and never while mu is held,
+	// so there is no lock ordering to reason about.
+	serveMu sync.Mutex
+
 	mu       sync.Mutex
 	services map[string]*advertisedService // service name -> advertised service
 	byKey    map[string]string             // registration key -> service name
@@ -269,7 +278,9 @@ func (m *Manager) advertise(rec *advertisedService, key string, b *backend) erro
 		mode.AcceptAppCaps = map[string][]string{"/": rec.caps}
 	}
 
-	ln, err := m.listenSvc(rec.name, mode)
+	m.serveMu.Lock()
+	rawLn, err := m.listenSvc(rec.name, mode)
+	m.serveMu.Unlock()
 	if err != nil {
 		m.abandon(rec)
 		if isMagicDNSError(err) {
@@ -300,21 +311,15 @@ func (m *Manager) advertise(rec *advertisedService, key string, b *backend) erro
 	var handler http.Handler = rp
 	handler = m.metrics.Middleware(rec.name, handler)
 
+	// Every close of this listener — ours below, http.Server.Close's, and the
+	// one http.Server.Serve makes on its way out — withdraws the service's
+	// handler from the serve config, so the lock belongs on the listener rather
+	// than on any one caller that remembers to take it.
+	ln := &serialisedListener{Listener: rawLn, mu: &m.serveMu}
+
 	httpSrv := &http.Server{Handler: handler}
 	ctx, cancel := context.WithCancel(context.Background())
-
-	m.mu.Lock()
-	if m.shutdown {
-		m.releaseLocked(rec)
-		m.mu.Unlock()
-		cancel()
-		_ = httpSrv.Close()
-		closeIdleConns(rp)
-		_ = ln.Close()
-		return errShuttingDown
-	}
-	rec.cancel = cancel
-	rec.closeFn = func() error {
+	closeFn := func() error {
 		_ = httpSrv.Close()
 		// This service's transport is its own, so its keep-alive connections
 		// to the departed backends have no other user. Without this a service
@@ -323,6 +328,17 @@ func (m *Manager) advertise(rec *advertisedService, key string, b *backend) erro
 		closeIdleConns(rp)
 		return ln.Close()
 	}
+
+	m.mu.Lock()
+	if m.shutdown {
+		m.releaseLocked(rec)
+		m.mu.Unlock()
+		cancel()
+		_ = closeFn()
+		return errShuttingDown
+	}
+	rec.cancel = cancel
+	rec.closeFn = closeFn
 	size := rec.pool.add(b)
 	rec.ready = true
 	close(rec.advertised)
@@ -346,6 +362,24 @@ func (m *Manager) advertise(rec *advertisedService, key string, b *backend) erro
 		"key", short(key),
 		"pool_size", size)
 	return nil
+}
+
+// serialisedListener is a service listener whose Close takes the serve-config
+// lock. Closing a tsnet ServiceListener removes the service's handler from the
+// node's serve config with the same ETag-guarded compare-and-swap ListenService
+// uses, and the close arrives from more than one place: the manager's own
+// teardown, http.Server.Close, and http.Server.Serve closing the listener it
+// was handed when it returns. Wrapping the listener covers all of them, so no
+// future caller has to remember the rule.
+type serialisedListener struct {
+	net.Listener
+	mu *sync.Mutex
+}
+
+func (l *serialisedListener) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.Listener.Close()
 }
 
 // abandon releases a claim on a service name whose listener could not be
