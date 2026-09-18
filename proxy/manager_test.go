@@ -1191,3 +1191,119 @@ func TestManager_CloseSkipsServiceAlreadyBeingWithdrawn(t *testing.T) {
 		t.Errorf("tsserve_service_backends series = %d after Close, want 0", got)
 	}
 }
+
+// Advertising two different services at once must not put two ListenService
+// calls in flight together: tsnet edits the node's serve config with a
+// compare-and-swap over its ETag, so overlapping edits make one of them fail
+// with an etag mismatch — which is what leaves a running, labelled backend
+// unserved at start-up, when every discovered service advertises at once.
+func TestManager_ConcurrentRegisterOfDifferentServicesDoesNotOverlapListen(t *testing.T) {
+	fake := newFakeListenSvc()
+	m := newTestManager(fake)
+	defer m.Close()
+
+	inner := fake.listenFn()
+	var inFlight, maxInFlight atomic.Int32
+	m.listenSvc = func(name string, mode tsnet.ServiceMode) (net.Listener, error) {
+		n := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			high := maxInFlight.Load()
+			if n <= high || maxInFlight.CompareAndSwap(high, n) {
+				break
+			}
+		}
+		// Stay inside the call: an unserialised advertisement of the other
+		// service arrives during this window and is counted above.
+		time.Sleep(50 * time.Millisecond)
+		return inner(name, mode)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i, name := range []string{"svc:web", "svc:api"} {
+		def := &ServiceDef{Service: name, Port: 80, Scheme: "http"}
+		ip := fmt.Sprintf("10.0.0.%d", i+1)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = m.Register(fmt.Sprintf("cid%d", i), def, ip)
+		}()
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Register %d: %v", i, err)
+		}
+	}
+	if got := maxInFlight.Load(); got != 1 {
+		t.Errorf("%d ListenService calls were in flight at once, want 1: serve-config edits must not overlap", got)
+	}
+	if got := len(m.Snapshot()); got != 2 {
+		t.Errorf("advertised services = %d, want 2", got)
+	}
+}
+
+// A withdrawal edits the serve config too, so it is serialised against
+// advertisement across service names: while one service's listener is closing,
+// another service must not be inside ListenService.
+func TestManager_AdvertiseWaitsForAnotherServicesTeardown(t *testing.T) {
+	fake := newFakeListenSvc()
+	m := newTestManager(fake)
+	defer m.Close()
+
+	closeEntered := make(chan struct{})
+	release := make(chan struct{})
+	inner := fake.listenFn()
+	var opened atomic.Int32
+	m.listenSvc = func(name string, mode tsnet.ServiceMode) (net.Listener, error) {
+		ln, err := inner(name, mode)
+		if err != nil || opened.Add(1) != 1 {
+			return ln, err
+		}
+		// Gate the first service's listener; its Close is the withdrawal this
+		// test holds open.
+		return &gatedListener{Listener: ln, entered: closeEntered, release: release}, nil
+	}
+
+	web := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
+	api := &ServiceDef{Service: "svc:api", Port: 80, Scheme: "http"}
+	if err := m.Register("cid-web", web, "10.0.0.1"); err != nil {
+		t.Fatalf("seed Register: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); m.Deregister("cid-web") }()
+	select {
+	case <-closeEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("withdrawal did not reach the listener close")
+	}
+
+	var regErr error
+	wg.Add(1)
+	go func() { defer wg.Done(); regErr = m.Register("cid-api", api, "10.0.0.2") }()
+	// Give the registration time to reach ListenService if nothing holds it
+	// back. It must not: the other service's handler is still being removed
+	// from the serve config.
+	time.Sleep(100 * time.Millisecond)
+	if n := opened.Load(); n != 1 {
+		t.Errorf("ListenService calls = %d while another service's listener was closing, want 1 (the seed advertisement only)", n)
+	}
+
+	close(release)
+	wg.Wait()
+
+	if regErr != nil {
+		t.Fatalf("Register racing another service's teardown: %v", regErr)
+	}
+	views := m.Snapshot()
+	if len(views) != 1 || views[0].Service != "svc:api" || len(views[0].Backends) != 1 {
+		t.Fatalf("snapshot = %+v, want svc:api serving one backend", views)
+	}
+	if n := opened.Load(); n != 2 {
+		t.Errorf("ListenService calls = %d overall, want 2 (one per advertisement)", n)
+	}
+}

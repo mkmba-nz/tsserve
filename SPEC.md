@@ -543,6 +543,7 @@ Connects to the Docker daemon via the Docker socket and monitors container lifec
 **Responsibilities:**
 - On startup, list all running containers and register any with valid `tsserve.*` labels.
 - Subscribe to Docker events. React to `start`, `die`, and `stop` events.
+- Between events, repeat the list/diff on a fixed sweep interval, registering labelled containers that are not serving and deregistering those that have gone.
 - For each qualifying container, resolve its IP on the configured Docker network.
 - Pass discovered service definitions to the Service Manager.
 - Two or more containers sharing a `tsserve.service` label both serve it: each joins that service's backend pool, keyed by its container ID.
@@ -551,7 +552,8 @@ Connects to the Docker daemon via the Docker socket and monitors container lifec
 - Use the `github.com/docker/docker/client` Go SDK.
 - Filter events to container types only.
 - When a container starts, wait briefly (e.g. 1s) for its network to be ready before resolving its IP.
-- Docker discovery is purely event-driven: there is no reconciliation loop. A container whose registration failed or was refused for a conflict is logged at Warn and rejoins only on its own next start event — not when the conflicting member later dies.
+- Docker discovery is event-driven, with a reconciliation sweep behind it: every 30 seconds the watcher re-lists containers and brings the registered set into line with what Docker reports. A container that is running and labelled but not serving — because its registration failed or was refused for a conflict — is retried on that cadence and registers once the cause clears, with no restart and no new start event. A container that has gone is deregistered, and its retry state is dropped with it.
+- Only record a container as active once `Register` reports the backend is serving, and log a failure at Warn once per distinct failure rather than once per sweep — the same rule the ECS watcher follows.
 
 ### 1b. ECS Watcher (`TSSERVE_DISCOVERY=ecs`)
 
@@ -598,6 +600,7 @@ A **backend** is one discovered endpoint (host and port) that can serve a servic
 **Implementation notes:**
 - `ListenService` can be called multiple times on the same `tsnet.Server` for different services — this is the core of how one node hosts many services.
 - Use a `sync.Mutex` or similar to protect the service map, since events arrive asynchronously and several ECS readers can register against one service name concurrently. A registration that finds the name occupied by a transition already in flight — a listener being opened, or one being closed after the last backend left — must wait for that transition rather than act on its own. `ListenService` is refused while a handler for the service's port is still in the serve config, so a registration that opened a listener before the outgoing one had finished closing would fail outright and leave the service dark until discovery came round again.
+- Serialise serve-config mutations across **all** service names, not just within one name. `ListenService` and the listener close that withdraws a service both edit the node's serve config as a read-modify-write guarded by an ETag, and tsnet neither locks nor retries: two such edits in flight together — two services advertising at once at start-up, or an advertisement racing another service's withdrawal — make one of them fail with an `etag mismatch`, leaving a running, labelled backend unserved. A second mutex, held only around those calls and never while the service-map mutex is held, is enough. Put it on the listener rather than on each caller: a service listener is closed by the manager's own teardown, by `http.Server.Close`, and by `http.Server.Serve` on its way out, and all three withdraw the handler. The cost is that advertisement becomes sequential — start-up advertises services one at a time, and a slow or hung `tailscaled` delays other services' advertisements and withdrawals rather than just the one registration waiting on it. Serialisation does not make the retry paths optional: `tailscaled` can rewrite the serve config independently of tsserve, so a failed registration must stay recoverable by the watchers.
 - Serving a request must never wait on a `ListenService` call or a listener teardown. Discovery writes a pool at most once per task or container change while the request path reads it on every request, so the pool is published copy-on-write and read without a lock.
 - Use `context.Context` cancellation for clean goroutine shutdown.
 
@@ -633,7 +636,7 @@ The "Container Start / Stop / Restart" subsections below describe Docker mode. T
 3. Wait for tsnet to be ready (connected to tailnet).
 4. Obtain `LocalClient` via `srv.LocalClient()` for the status-page tailnet view.
 5. Select the watcher based on `TSSERVE_DISCOVERY` (`docker` or `ecs`).
-6. Start the watcher. It performs an initial enumeration (Docker: `ContainerList` + event subscription; ECS: `ListTasks` + the first poll) and registers any qualifying backends.
+6. Start the watcher. It performs an initial enumeration (Docker: `ContainerList` + event subscription; ECS: `ListTasks` + the first poll) and registers any qualifying backends. Both watchers then keep repeating that enumeration — the ECS poll interval, the Docker sweep interval — so a backend that failed to register the first time is not stranded.
 
 ### Container Start
 
@@ -651,6 +654,7 @@ The "Container Start / Stop / Restart" subsections below describe Docker mode. T
 3. If other backends remain, that is all: the listener stays open and requests keep being served by the rest of the pool.
 4. If the pool is now empty, close the `ServiceListener`. In-flight requests will complete; new connections are refused. Drop the advertised service.
 5. Log: `"backend left service"` with the resulting pool size, or `"service withdrawn; last backend left"`.
+6. A container that disappears without an event — a dropped event stream, a daemon restart — is picked up by the next sweep instead: it is no longer listed, so it is deregistered by the same steps, logged as `"container gone; deregistered"`.
 
 ### Container IP Change (Restart)
 
@@ -669,9 +673,9 @@ When a container restarts, Docker emits `die` then `start`. The stop handler rem
 
 | Scenario | Behaviour |
 |---|---|
-| `ListenService` fails (e.g. service not defined, node untagged) | `Register` returns an error; the backend is not recorded as active. Do not crash. ECS logs it at Warn on the first failure (quiet while the same failure persists) and retries on the next poll cycle; Docker logs it at Warn and retries on the container's next start event. |
+| `ListenService` fails (e.g. service not defined, node untagged, serve-config `etag mismatch`) | `Register` returns an error; the backend is not recorded as active. Do not crash. Both watchers log it at Warn on the first failure (quiet while the same failure persists) and retry the container or task on their next cycle — the ECS poll interval, or the Docker sweep interval — so a failure is recovered from without a restart. |
 | `ListenService` fails because HTTPS/MagicDNS not enabled | Fatal error on first occurrence. Exit with a clear message telling the user to enable HTTPS and MagicDNS in the admin console. |
-| Container IP cannot be resolved | Log warning. Skip this container. Retry on next Docker event for this container. |
+| Container IP cannot be resolved | Log warning (Debug while the same failure repeats, so a sweep does not warn on every cycle). Skip this container. Retry on the next Docker event for this container, or on the next sweep. |
 | Backend unreachable (container crashed but event not yet received) | The reverse proxy tries the remaining pool members when the request carries no body, and returns the first successful response. When every member fails, or the request carries a body, the client gets a 502. Normal behaviour. |
 | Docker socket unavailable at startup (Docker mode) | Fatal error. Exit with message. |
 | ECS `DescribeTasks` returns `AccessDeniedException` (ECS mode) | Fatal error on first occurrence. Exit with message naming the IAM action that was denied. |
