@@ -78,7 +78,7 @@ All labels are prefixed with `tsserve.`.
 |---|---|---|
 | `tsserve.network` | `bridge` | Docker network to use when resolving the container's IP address. |
 | `tsserve.scheme` | `http` | Scheme to use when connecting to the backend: `http` or `https`. Use `https` if the backend terminates TLS itself (rare — most containers serve plain HTTP internally). |
-| `tsserve.caps` | _(none)_ | App capabilities to accept and forward. Comma-separated list of capability names, mounted at `/`. Also enables [node identity headers](#node-identity-headers) (`Tailscale-Node-Tags`, `Tailscale-Node-Name`) for tagged peers. See [App Capabilities](#app-capabilities). |
+| `tsserve.caps` | _(none)_ | App capabilities to accept and forward. Comma-separated list of capability names, mounted at `/`. See [App Capabilities](#app-capabilities). |
 
 The Tailscale-facing side is always HTTPS on port 443 with automatic TLS certificates. This is not configurable — it is the only sensible default for Tailscale Services and matches how `tsnet.ListenService` with `ServiceModeHTTP{HTTPS: true, Port: 443}` works.
 
@@ -156,14 +156,14 @@ If `tsserve.caps` is not set, `AcceptAppCaps` is left nil and no capability head
 
 App capabilities carry the *granted capability values*, not the connecting node's own identity, and Tailscale's serve layer does not populate the `Tailscale-User-*` headers for tagged (non-user) nodes. A backend therefore cannot tell one tagged device (e.g. a CI runner) from another, and — unlike `tailscaled` — it cannot run a `whois` itself.
 
-To fill this gap, **whenever `tsserve.caps` is set**, tsserve resolves the connecting peer in-process (`LocalClient.WhoIs`) and, for **tagged nodes only**, injects two extra headers before proxying to the backend:
+To fill this gap, on **every request to every service**, whatever the backend type and whether or not `tsserve.caps` is set, tsserve resolves the connecting peer in-process (`LocalClient.WhoIs`) and injects node identity headers before proxying to the backend:
 
-| Header | Value |
-| --- | --- |
-| `Tailscale-Node-Tags` | The node's ACL tags, comma-separated, with the `tag:` prefix stripped (e.g. `github-runner,prod`). |
-| `Tailscale-Node-Name` | The node's `ComputedName` (its MagicDNS base name / hostname). |
+| Header | Sent for | Value |
+| --- | --- | --- |
+| `Tailscale-Node-Name` | Every node, user-owned or tagged | The node's `ComputedName` (its MagicDNS base name / hostname). |
+| `Tailscale-Node-Tags` | Tagged nodes only | The node's ACL tags, comma-separated, with the `tag:` prefix stripped (e.g. `github-runner,prod`). |
 
-There is no separate opt-in: node-header injection rides on the same `tsserve.caps` opt-in as app capabilities. Untagged (user) nodes receive neither header. If the WhoIs lookup fails, no headers are injected.
+If the WhoIs lookup fails, no headers are injected.
 
 Like the identity and app-capability headers Serve manages, **both node headers are stripped from the inbound request before forwarding**, so a client cannot spoof them. The peer IP used for the lookup is taken from the `X-Forwarded-For` header the serve layer sets to the peer's tailnet IP.
 
@@ -613,7 +613,7 @@ One Go `net/http/httputil.ReverseProxy` per advertised service, shared by every 
 - **Retry rule.** When an attempt fails *before the request was written to the backend* (dial refused, dial timeout, no route, DNS failure, TLS handshake failure) and the request carries no body, try the remaining pool members in rotation order, at most once each, and return the first successful response. In every other case — a failure after the request was written, or a request carrying a body — there is no retry and the client gets a 502. Retrying is done at the `RoundTrip` boundary, where nothing has yet been written to the client, so it can never replay a request a backend has already acted on. Server requests have no rewindable body, which is why a request carrying one is never retried; clients needing that reliability retry themselves.
 - Bound connection establishment to a few seconds (5s) for both `http` and `https` services, so a blackholed member costs a request one dial timeout rather than the Go default of 30s before the next member is tried.
 - Set `X-Forwarded-For`, `X-Forwarded-Proto` headers (Go's ReverseProxy does `X-Forwarded-For` by default). The outbound URL host and `Host` header name the backend that actually receives each attempt.
-- When the service has opted into `tsserve.caps`, inject [node identity headers](#node-identity-headers) (`Tailscale-Node-Tags`, `Tailscale-Node-Name`) for tagged peers, resolved via `LocalClient.WhoIs`, and strip any inbound copies of those headers first to prevent spoofing.
+- Inject [node identity headers](#node-identity-headers) (`Tailscale-Node-Name` for every peer, `Tailscale-Node-Tags` for tagged peers), resolved via `LocalClient.WhoIs`, and strip any inbound copies of those headers first to prevent spoofing.
 - Log proxy errors, naming the backend each failed attempt targeted.
 
 **Implementation notes:**

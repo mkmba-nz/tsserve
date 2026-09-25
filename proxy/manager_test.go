@@ -166,8 +166,8 @@ func TestManager_RegisterAddsServiceToSnapshot(t *testing.T) {
 	defer m.Close()
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
-	if err := m.Register("cid1", def, "10.0.0.1"); err != nil {
-		t.Fatalf("Register: %v", err)
+	if err := m.RegisterHostPort("cid1", def, "10.0.0.1"); err != nil {
+		t.Fatalf("RegisterHostPort: %v", err)
 	}
 
 	views := m.Snapshot()
@@ -203,8 +203,8 @@ func TestManager_RegisterPassesAppCapsToListenService(t *testing.T) {
 		Scheme:  "http",
 		Caps:    []string{"example.com/cap/read", "example.com/cap/admin"},
 	}
-	if err := m.Register("cid1", def, "10.0.0.2"); err != nil {
-		t.Fatalf("Register: %v", err)
+	if err := m.RegisterHostPort("cid1", def, "10.0.0.2"); err != nil {
+		t.Fatalf("RegisterHostPort: %v", err)
 	}
 
 	fake.mu.Lock()
@@ -233,7 +233,7 @@ func TestManager_RegisterWithoutCapsLeavesAcceptAppCapsNil(t *testing.T) {
 	defer m.Close()
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
-	_ = m.Register("cid1", def, "10.0.0.1")
+	_ = m.RegisterHostPort("cid1", def, "10.0.0.1")
 
 	fake.mu.Lock()
 	mode := fake.requests[0].mode.(tsnet.ServiceModeHTTP)
@@ -249,11 +249,11 @@ func TestManager_DuplicateRegistrationKeyIsNoOp(t *testing.T) {
 	defer m.Close()
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
-	if err := m.Register("cid1", def, "10.0.0.1"); err != nil {
-		t.Fatalf("first Register: %v", err)
+	if err := m.RegisterHostPort("cid1", def, "10.0.0.1"); err != nil {
+		t.Fatalf("first RegisterHostPort: %v", err)
 	}
-	if err := m.Register("cid1", def, "10.0.0.99"); err != nil {
-		t.Fatalf("second Register: %v", err)
+	if err := m.RegisterHostPort("cid1", def, "10.0.0.99"); err != nil {
+		t.Fatalf("second RegisterHostPort: %v", err)
 	}
 	if n := fake.listenCount("svc:web"); n != 1 {
 		t.Errorf("ListenService called %d times for the same registration key, want 1", n)
@@ -271,10 +271,10 @@ func TestManager_SecondKeyForServiceJoinsPool(t *testing.T) {
 	defer m.Close()
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
-	if err := m.Register("cid-first", def, "10.0.0.1"); err != nil {
+	if err := m.RegisterHostPort("cid-first", def, "10.0.0.1"); err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	if err := m.Register("cid-second", def, "10.0.0.2"); err != nil {
+	if err := m.RegisterHostPort("cid-second", def, "10.0.0.2"); err != nil {
 		t.Fatalf("second: %v", err)
 	}
 
@@ -313,10 +313,10 @@ func TestManager_BackendsFromDifferentOriginsSharePool(t *testing.T) {
 	readerBDef := &ServiceDef{Service: "svc:api", Port: 49153, Scheme: "http",
 		Origin: Origin{Account: "222222222222", Cluster: "cluster-b"}}
 
-	if err := m.Register("arn:aws:ecs:x:111111111111:task/cluster-a/a#api", readerADef, "10.0.0.1"); err != nil {
+	if err := m.RegisterHostPort("arn:aws:ecs:x:111111111111:task/cluster-a/a#api", readerADef, "10.0.0.1"); err != nil {
 		t.Fatalf("reader A: %v", err)
 	}
-	if err := m.Register("arn:aws:ecs:x:222222222222:task/cluster-b/b#api", readerBDef, "10.1.0.1"); err != nil {
+	if err := m.RegisterHostPort("arn:aws:ecs:x:222222222222:task/cluster-b/b#api", readerBDef, "10.1.0.1"); err != nil {
 		t.Fatalf("reader B: %v", err)
 	}
 
@@ -367,7 +367,7 @@ func TestManager_ConcurrentRegisterOpensOneListener(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			started <- struct{}{}
-			errs[i] = m.Register(fmt.Sprintf("cid%d", i), def, ip)
+			errs[i] = m.RegisterHostPort(fmt.Sprintf("cid%d", i), def, ip)
 		}()
 	}
 	// Both goroutines have entered Register, and the first is parked inside
@@ -382,7 +382,7 @@ func TestManager_ConcurrentRegisterOpensOneListener(t *testing.T) {
 
 	for i, err := range errs {
 		if err != nil {
-			t.Fatalf("Register %d: %v", i, err)
+			t.Fatalf("RegisterHostPort %d: %v", i, err)
 		}
 	}
 	if got := listens.Load(); got != 1 {
@@ -403,14 +403,14 @@ func TestManager_RegisterRacingLastDeregisterEndsServing(t *testing.T) {
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
 	for round := 0; round < 100; round++ {
-		if err := m.Register("cid-old", def, "10.0.0.1"); err != nil {
+		if err := m.RegisterHostPort("cid-old", def, "10.0.0.1"); err != nil {
 			t.Fatalf("seed Register: %v", err)
 		}
 		var wg sync.WaitGroup
 		wg.Add(2)
 		var regErr error
 		go func() { defer wg.Done(); m.Deregister("cid-old") }()
-		go func() { defer wg.Done(); regErr = m.Register("cid-new", def, "10.0.0.2") }()
+		go func() { defer wg.Done(); regErr = m.RegisterHostPort("cid-new", def, "10.0.0.2") }()
 		wg.Wait()
 		if regErr != nil {
 			t.Fatalf("round %d: Register: %v", round, regErr)
@@ -451,8 +451,8 @@ func TestManager_DeregisterClosesListenerAndClearsState(t *testing.T) {
 	defer m.Close()
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
-	if err := m.Register("cid1", def, "10.0.0.1"); err != nil {
-		t.Fatalf("Register: %v", err)
+	if err := m.RegisterHostPort("cid1", def, "10.0.0.1"); err != nil {
+		t.Fatalf("RegisterHostPort: %v", err)
 	}
 
 	closeCh := fake.waitClose("svc:web")
@@ -468,7 +468,7 @@ func TestManager_DeregisterClosesListenerAndClearsState(t *testing.T) {
 	}
 
 	// After deregistration, the service name should be free again.
-	if err := m.Register("cid2", def, "10.0.0.2"); err != nil {
+	if err := m.RegisterHostPort("cid2", def, "10.0.0.2"); err != nil {
 		t.Fatalf("re-Register: %v", err)
 	}
 	if got := m.Snapshot()[0].Backends[0].Key; got != "cid2" {
@@ -484,11 +484,11 @@ func TestManager_DeregisterClosesListenerOnlyOnLastBackend(t *testing.T) {
 	defer m.Close()
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
-	if err := m.Register("cid1", def, "10.0.0.1"); err != nil {
-		t.Fatalf("Register cid1: %v", err)
+	if err := m.RegisterHostPort("cid1", def, "10.0.0.1"); err != nil {
+		t.Fatalf("RegisterHostPort cid1: %v", err)
 	}
-	if err := m.Register("cid2", def, "10.0.0.2"); err != nil {
-		t.Fatalf("Register cid2: %v", err)
+	if err := m.RegisterHostPort("cid2", def, "10.0.0.2"); err != nil {
+		t.Fatalf("RegisterHostPort cid2: %v", err)
 	}
 	closeCh := fake.waitClose("svc:web")
 
@@ -521,8 +521,8 @@ func TestManager_CloseTearsDownPooledServiceOnce(t *testing.T) {
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
 	for i, ip := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"} {
-		if err := m.Register(fmt.Sprintf("cid%d", i), def, ip); err != nil {
-			t.Fatalf("Register %d: %v", i, err)
+		if err := m.RegisterHostPort(fmt.Sprintf("cid%d", i), def, ip); err != nil {
+			t.Fatalf("RegisterHostPort %d: %v", i, err)
 		}
 	}
 	closeCh := fake.waitClose("svc:web")
@@ -546,7 +546,7 @@ func TestManager_RegisterListenServiceErrorIsReturnedNotFatal(t *testing.T) {
 	defer m.Close()
 
 	def := &ServiceDef{Service: "svc:bad", Port: 80, Scheme: "http"}
-	err := m.Register("cid1", def, "10.0.0.1")
+	err := m.RegisterHostPort("cid1", def, "10.0.0.1")
 	if err == nil {
 		t.Fatalf("want an error when ListenService fails, got nil")
 	}
@@ -565,7 +565,7 @@ func TestManager_RegisterListenServiceErrorIsReturnedNotFatal(t *testing.T) {
 	fake.mu.Lock()
 	delete(fake.errOn, "svc:bad")
 	fake.mu.Unlock()
-	if err := m.Register("cid2", &ServiceDef{Service: "svc:bad", Port: 80, Scheme: "http"}, "10.0.0.2"); err != nil {
+	if err := m.RegisterHostPort("cid2", &ServiceDef{Service: "svc:bad", Port: 80, Scheme: "http"}, "10.0.0.2"); err != nil {
 		t.Fatalf("retry Register: %v", err)
 	}
 	if got := backendsOf(t, m, "svc:bad"); len(got) != 1 || got[0] != "http://10.0.0.2:80" {
@@ -592,11 +592,11 @@ func TestManager_RefusesConflictingBackend(t *testing.T) {
 			defer m.Close()
 
 			advertised := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http", Caps: []string{"example.com/cap/read"}}
-			if err := m.Register("cid1", advertised, "10.0.0.1"); err != nil {
-				t.Fatalf("Register: %v", err)
+			if err := m.RegisterHostPort("cid1", advertised, "10.0.0.1"); err != nil {
+				t.Fatalf("RegisterHostPort: %v", err)
 			}
 
-			err := m.Register("cid2", tc.def, "10.0.0.2")
+			err := m.RegisterHostPort("cid2", tc.def, "10.0.0.2")
 			var ce *ConflictError
 			if !errors.As(err, &ce) {
 				t.Fatalf("error = %v (%T), want *ConflictError", err, err)
@@ -632,11 +632,11 @@ func TestManager_CapsCompareAsSets(t *testing.T) {
 	second := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http",
 		Caps: []string{"example.com/cap/admin", "example.com/cap/read", "example.com/cap/read"}}
 
-	if err := m.Register("cid1", first, "10.0.0.1"); err != nil {
-		t.Fatalf("Register cid1: %v", err)
+	if err := m.RegisterHostPort("cid1", first, "10.0.0.1"); err != nil {
+		t.Fatalf("RegisterHostPort cid1: %v", err)
 	}
-	if err := m.Register("cid2", second, "10.0.0.2"); err != nil {
-		t.Fatalf("Register cid2: %v", err)
+	if err := m.RegisterHostPort("cid2", second, "10.0.0.2"); err != nil {
+		t.Fatalf("RegisterHostPort cid2: %v", err)
 	}
 	if got := backendsOf(t, m, "svc:web"); len(got) != 2 {
 		t.Errorf("pool = %v, want 2 members", got)
@@ -653,16 +653,16 @@ func TestManager_RefusedBackendCanAdvertiseAfterTeardown(t *testing.T) {
 	http1 := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
 	https2 := &ServiceDef{Service: "svc:web", Port: 443, Scheme: "https"}
 
-	if err := m.Register("cid1", http1, "10.0.0.1"); err != nil {
-		t.Fatalf("Register cid1: %v", err)
+	if err := m.RegisterHostPort("cid1", http1, "10.0.0.1"); err != nil {
+		t.Fatalf("RegisterHostPort cid1: %v", err)
 	}
 	var ce *ConflictError
-	if err := m.Register("cid2", https2, "10.0.0.2"); !errors.As(err, &ce) {
-		t.Fatalf("Register cid2 = %v, want *ConflictError", err)
+	if err := m.RegisterHostPort("cid2", https2, "10.0.0.2"); !errors.As(err, &ce) {
+		t.Fatalf("RegisterHostPort cid2 = %v, want *ConflictError", err)
 	}
 	m.Deregister("cid1")
 
-	if err := m.Register("cid2", https2, "10.0.0.2"); err != nil {
+	if err := m.RegisterHostPort("cid2", https2, "10.0.0.2"); err != nil {
 		t.Fatalf("re-Register cid2: %v", err)
 	}
 	views := m.Snapshot()
@@ -681,7 +681,7 @@ func TestManager_RegisterListenServiceMagicDNSErrorIsFatal(t *testing.T) {
 	defer m.Close()
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
-	err := m.Register("cid1", def, "10.0.0.1")
+	err := m.RegisterHostPort("cid1", def, "10.0.0.1")
 	if err == nil {
 		t.Fatalf("want FatalError, got nil")
 	}
@@ -697,8 +697,8 @@ func TestManager_CloseTearsDownAllAndRefusesNewRegistrations(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		def := &ServiceDef{Service: fmt.Sprintf("svc:s%d", i), Port: 80, Scheme: "http"}
-		if err := m.Register(fmt.Sprintf("cid%d", i), def, "10.0.0.1"); err != nil {
-			t.Fatalf("Register: %v", err)
+		if err := m.RegisterHostPort(fmt.Sprintf("cid%d", i), def, "10.0.0.1"); err != nil {
+			t.Fatalf("RegisterHostPort: %v", err)
 		}
 	}
 
@@ -717,7 +717,7 @@ func TestManager_CloseTearsDownAllAndRefusesNewRegistrations(t *testing.T) {
 	}
 
 	// Register after Close must fail.
-	err := m.Register("cidN", &ServiceDef{Service: "svc:new", Port: 80, Scheme: "http"}, "10.0.0.1")
+	err := m.RegisterHostPort("cidN", &ServiceDef{Service: "svc:new", Port: 80, Scheme: "http"}, "10.0.0.1")
 	if err == nil || err.Error() != "manager is shutting down" {
 		t.Errorf("Register after Close: %v, want 'manager is shutting down'", err)
 	}
@@ -738,7 +738,7 @@ func TestManager_ConcurrentRegisterDeregisterDoesNotPanic(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			def := &ServiceDef{Service: fmt.Sprintf("svc:s%d", i), Port: 80, Scheme: "http"}
-			if err := m.Register(fmt.Sprintf("cid%d", i), def, "10.0.0.1"); err != nil {
+			if err := m.RegisterHostPort(fmt.Sprintf("cid%d", i), def, "10.0.0.1"); err != nil {
 				failures.Add(1)
 			}
 		}()
@@ -800,8 +800,8 @@ func TestManager_MetricsCountServicesAndBackendsSeparately(t *testing.T) {
 	defer m.Close()
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
-	if err := m.Register("cid1", def, "10.0.0.1"); err != nil {
-		t.Fatalf("Register cid1: %v", err)
+	if err := m.RegisterHostPort("cid1", def, "10.0.0.1"); err != nil {
+		t.Fatalf("RegisterHostPort cid1: %v", err)
 	}
 	if got := testutil.ToFloat64(m.metrics.Active); got != 1 {
 		t.Errorf("tsserve_services_active = %v, want 1", got)
@@ -810,8 +810,8 @@ func TestManager_MetricsCountServicesAndBackendsSeparately(t *testing.T) {
 		t.Errorf("tsserve_service_backends{svc:web} = %v, want 1", got)
 	}
 
-	if err := m.Register("cid2", def, "10.0.0.2"); err != nil {
-		t.Fatalf("Register cid2: %v", err)
+	if err := m.RegisterHostPort("cid2", def, "10.0.0.2"); err != nil {
+		t.Fatalf("RegisterHostPort cid2: %v", err)
 	}
 	if got := testutil.ToFloat64(m.metrics.Active); got != 1 {
 		t.Errorf("tsserve_services_active = %v after a second backend, want 1", got)
@@ -847,8 +847,8 @@ func TestManager_CloseClearsMetrics(t *testing.T) {
 
 	for i, name := range []string{"svc:a", "svc:b"} {
 		def := &ServiceDef{Service: name, Port: 80, Scheme: "http"}
-		if err := m.Register(fmt.Sprintf("cid%d", i), def, "10.0.0.1"); err != nil {
-			t.Fatalf("Register %s: %v", name, err)
+		if err := m.RegisterHostPort(fmt.Sprintf("cid%d", i), def, "10.0.0.1"); err != nil {
+			t.Fatalf("RegisterHostPort %s: %v", name, err)
 		}
 	}
 	if got := testutil.CollectAndCount(m.metrics.Backends); got != 2 {
@@ -904,7 +904,7 @@ func TestManager_RegisterDuringTeardownWaitsForListenerToClose(t *testing.T) {
 	}
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
-	if err := m.Register("cid-old", def, "10.0.0.1"); err != nil {
+	if err := m.RegisterHostPort("cid-old", def, "10.0.0.1"); err != nil {
 		t.Fatalf("seed Register: %v", err)
 	}
 
@@ -928,7 +928,7 @@ func TestManager_RegisterDuringTeardownWaitsForListenerToClose(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		close(started)
-		regErr = m.Register("cid-new", def, "10.0.0.2")
+		regErr = m.RegisterHostPort("cid-new", def, "10.0.0.2")
 	}()
 	<-started
 	// Give the registration time to reach ListenService if it is going to. It
@@ -943,7 +943,7 @@ func TestManager_RegisterDuringTeardownWaitsForListenerToClose(t *testing.T) {
 	wg.Wait()
 
 	if regErr != nil {
-		t.Fatalf("Register racing teardown: %v", regErr)
+		t.Fatalf("RegisterHostPort racing teardown: %v", regErr)
 	}
 	views := m.Snapshot()
 	if len(views) != 1 || len(views[0].Backends) != 1 || views[0].Backends[0].Key != "cid-new" {
@@ -964,8 +964,8 @@ func TestManager_LogsDistinguishAdvertisingFromPoolChanges(t *testing.T) {
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
 	for i, ip := range []string{"10.0.0.1", "10.0.0.2"} {
-		if err := m.Register(fmt.Sprintf("cid%d", i), def, ip); err != nil {
-			t.Fatalf("Register %d: %v", i, err)
+		if err := m.RegisterHostPort(fmt.Sprintf("cid%d", i), def, ip); err != nil {
+			t.Fatalf("RegisterHostPort %d: %v", i, err)
 		}
 	}
 	m.Deregister("cid0")
@@ -1017,7 +1017,7 @@ func TestManager_MetricsSurviveReadvertiseDuringTeardown(t *testing.T) {
 	}
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
-	if err := m.Register("cid-old", def, "10.0.0.1"); err != nil {
+	if err := m.RegisterHostPort("cid-old", def, "10.0.0.1"); err != nil {
 		t.Fatalf("seed Register: %v", err)
 	}
 
@@ -1036,7 +1036,7 @@ func TestManager_MetricsSurviveReadvertiseDuringTeardown(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		close(started)
-		regErr = m.Register("cid-new", def, "10.0.0.2")
+		regErr = m.RegisterHostPort("cid-new", def, "10.0.0.2")
 	}()
 	<-started
 	time.Sleep(50 * time.Millisecond)
@@ -1044,7 +1044,7 @@ func TestManager_MetricsSurviveReadvertiseDuringTeardown(t *testing.T) {
 	wg.Wait()
 
 	if regErr != nil {
-		t.Fatalf("Register racing teardown: %v", regErr)
+		t.Fatalf("RegisterHostPort racing teardown: %v", regErr)
 	}
 	if got := testutil.ToFloat64(m.metrics.Active); got != 1 {
 		t.Errorf("tsserve_services_active = %v, want 1: the service is advertised", got)
@@ -1092,8 +1092,8 @@ func TestManager_SnapshotOmitsServiceBeingWithdrawn(t *testing.T) {
 	_, entered, release := gateFirstListener(t, m, fake)
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
-	if err := m.Register("cid-1", def, "10.0.0.1"); err != nil {
-		t.Fatalf("Register: %v", err)
+	if err := m.RegisterHostPort("cid-1", def, "10.0.0.1"); err != nil {
+		t.Fatalf("RegisterHostPort: %v", err)
 	}
 	if got := m.Snapshot(); len(got) != 1 || len(got[0].Backends) != 1 {
 		t.Fatalf("Snapshot while serving = %+v, want 1 service with 1 backend", got)
@@ -1134,8 +1134,8 @@ func TestManager_CloseSkipsServiceAlreadyBeingWithdrawn(t *testing.T) {
 	_, entered, release := gateFirstListener(t, m, fake)
 
 	def := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
-	if err := m.Register("cid-1", def, "10.0.0.1"); err != nil {
-		t.Fatalf("Register: %v", err)
+	if err := m.RegisterHostPort("cid-1", def, "10.0.0.1"); err != nil {
+		t.Fatalf("RegisterHostPort: %v", err)
 	}
 
 	// Count teardowns rather than listener closes: one teardown closes the
@@ -1227,14 +1227,14 @@ func TestManager_ConcurrentRegisterOfDifferentServicesDoesNotOverlapListen(t *te
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = m.Register(fmt.Sprintf("cid%d", i), def, ip)
+			errs[i] = m.RegisterHostPort(fmt.Sprintf("cid%d", i), def, ip)
 		}()
 	}
 	wg.Wait()
 
 	for i, err := range errs {
 		if err != nil {
-			t.Fatalf("Register %d: %v", i, err)
+			t.Fatalf("RegisterHostPort %d: %v", i, err)
 		}
 	}
 	if got := maxInFlight.Load(); got != 1 {
@@ -1269,7 +1269,7 @@ func TestManager_AdvertiseWaitsForAnotherServicesTeardown(t *testing.T) {
 
 	web := &ServiceDef{Service: "svc:web", Port: 80, Scheme: "http"}
 	api := &ServiceDef{Service: "svc:api", Port: 80, Scheme: "http"}
-	if err := m.Register("cid-web", web, "10.0.0.1"); err != nil {
+	if err := m.RegisterHostPort("cid-web", web, "10.0.0.1"); err != nil {
 		t.Fatalf("seed Register: %v", err)
 	}
 
@@ -1284,7 +1284,7 @@ func TestManager_AdvertiseWaitsForAnotherServicesTeardown(t *testing.T) {
 
 	var regErr error
 	wg.Add(1)
-	go func() { defer wg.Done(); regErr = m.Register("cid-api", api, "10.0.0.2") }()
+	go func() { defer wg.Done(); regErr = m.RegisterHostPort("cid-api", api, "10.0.0.2") }()
 	// Give the registration time to reach ListenService if nothing holds it
 	// back. It must not: the other service's handler is still being removed
 	// from the serve config.
@@ -1297,7 +1297,7 @@ func TestManager_AdvertiseWaitsForAnotherServicesTeardown(t *testing.T) {
 	wg.Wait()
 
 	if regErr != nil {
-		t.Fatalf("Register racing another service's teardown: %v", regErr)
+		t.Fatalf("RegisterHostPort racing another service's teardown: %v", regErr)
 	}
 	views := m.Snapshot()
 	if len(views) != 1 || views[0].Service != "svc:api" || len(views[0].Backends) != 1 {
@@ -1305,5 +1305,208 @@ func TestManager_AdvertiseWaitsForAnotherServicesTeardown(t *testing.T) {
 	}
 	if n := opened.Load(); n != 2 {
 		t.Errorf("ListenService calls = %d overall, want 2 (one per advertisement)", n)
+	}
+}
+
+func functionDef(service, arn, qualifier string) *FunctionDef {
+	return &FunctionDef{
+		Service: service,
+		Origin:  Origin{Account: "111122223333", Region: "us-east-1"},
+		Invoker: NewFunctionInvoker(nil, arn, qualifier),
+	}
+}
+
+const (
+	fnHello = "arn:aws:lambda:us-east-1:111122223333:function:hello"
+	fnHi    = "arn:aws:lambda:us-east-1:111122223333:function:hi"
+)
+
+func TestManager_RegisterFunctionAdvertisesLambdaService(t *testing.T) {
+	fake := newFakeListenSvc()
+	m := newTestManager(fake)
+	defer m.Close()
+
+	if err := m.RegisterFunction(fnHello, functionDef("svc:hello", fnHello, "live")); err != nil {
+		t.Fatalf("RegisterFunction: %v", err)
+	}
+	if n := fake.listenCount("svc:hello"); n != 1 {
+		t.Fatalf("ListenService calls = %d, want 1", n)
+	}
+	views := m.Snapshot()
+	if len(views) != 1 || views[0].Scheme != SchemeLambda || len(views[0].Backends) != 1 {
+		t.Fatalf("snapshot = %+v, want one lambda service with one backend", views)
+	}
+	b := views[0].Backends[0]
+	if b.Backend != "lambda://"+fnHello+":live" {
+		t.Errorf("Backend = %q", b.Backend)
+	}
+	if b.Key != fnHello {
+		t.Errorf("Key = %q, want the function ARN", b.Key)
+	}
+	if b.Origin != (Origin{Account: "111122223333", Region: "us-east-1"}) {
+		t.Errorf("Origin = %+v", b.Origin)
+	}
+
+	// Registration is idempotent on key.
+	if err := m.RegisterFunction(fnHello, functionDef("svc:hello", fnHello, "live")); err != nil {
+		t.Fatalf("repeat RegisterFunction: %v", err)
+	}
+	if got := backendsOf(t, m, "svc:hello"); len(got) != 1 {
+		t.Errorf("pool = %v after a repeat registration, want 1 member", got)
+	}
+}
+
+func TestManager_SecondFunctionJoinsPoolAndLastLeavingWithdraws(t *testing.T) {
+	fake := newFakeListenSvc()
+	m := newTestManager(fake)
+	m.metrics = metrics.New()
+	defer m.Close()
+
+	for _, arn := range []string{fnHello, fnHi} {
+		if err := m.RegisterFunction(arn, functionDef("svc:hello", arn, "")); err != nil {
+			t.Fatalf("RegisterFunction(%s): %v", arn, err)
+		}
+	}
+	want := []string{"lambda://" + fnHello, "lambda://" + fnHi}
+	if got := backendsOf(t, m, "svc:hello"); len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("pool = %v, want %v", got, want)
+	}
+	if n := fake.listenCount("svc:hello"); n != 1 {
+		t.Errorf("ListenService calls = %d, want 1", n)
+	}
+	if got := testutil.ToFloat64(m.metrics.Backends.WithLabelValues("svc:hello")); got != 2 {
+		t.Errorf("tsserve_service_backends = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.metrics.Active); got != 1 {
+		t.Errorf("tsserve_services_active = %v, want 1", got)
+	}
+
+	closeCh := fake.waitClose("svc:hello")
+	m.Deregister(fnHello)
+	select {
+	case <-closeCh:
+		t.Fatal("listener closed while a function remained")
+	default:
+	}
+	m.Deregister(fnHi)
+	select {
+	case <-closeCh:
+	case <-time.After(time.Second):
+		t.Fatal("listener was not closed after the last function left")
+	}
+	if got := m.Snapshot(); len(got) != 0 {
+		t.Errorf("snapshot = %+v, want empty", got)
+	}
+	if got := testutil.ToFloat64(m.metrics.Active); got != 0 {
+		t.Errorf("tsserve_services_active = %v, want 0", got)
+	}
+}
+
+// Pools are homogeneous: a container backend offered to a function-backed
+// service is refused, as is a function offered to a container-backed one.
+func TestManager_RefusesMixedPools(t *testing.T) {
+	t.Run("container into function service", func(t *testing.T) {
+		m := newTestManager(newFakeListenSvc())
+		defer m.Close()
+		if err := m.RegisterFunction(fnHello, functionDef("svc:hello", fnHello, "")); err != nil {
+			t.Fatalf("RegisterFunction: %v", err)
+		}
+		err := m.RegisterHostPort("cid1", &ServiceDef{Service: "svc:hello", Port: 80, Scheme: "http"}, "10.0.0.1")
+		var ce *ConflictError
+		if !errors.As(err, &ce) || ce.Field != "scheme" || ce.Advertised != SchemeLambda || ce.Offered != "http" {
+			t.Fatalf("error = %v, want a scheme ConflictError lambda vs http", err)
+		}
+		if got := backendsOf(t, m, "svc:hello"); len(got) != 1 || got[0] != "lambda://"+fnHello {
+			t.Errorf("pool = %v, want only the function", got)
+		}
+	})
+	t.Run("function into container service", func(t *testing.T) {
+		m := newTestManager(newFakeListenSvc())
+		defer m.Close()
+		if err := m.RegisterHostPort("cid1", &ServiceDef{Service: "svc:hello", Port: 80, Scheme: "http"}, "10.0.0.1"); err != nil {
+			t.Fatalf("RegisterHostPort: %v", err)
+		}
+		err := m.RegisterFunction(fnHello, functionDef("svc:hello", fnHello, ""))
+		var ce *ConflictError
+		if !errors.As(err, &ce) || ce.Field != "scheme" || ce.Advertised != "http" || ce.Offered != SchemeLambda {
+			t.Fatalf("error = %v, want a scheme ConflictError http vs lambda", err)
+		}
+		if got := backendsOf(t, m, "svc:hello"); len(got) != 1 || got[0] != "http://10.0.0.1:80" {
+			t.Errorf("pool = %v, want only the container", got)
+		}
+	})
+}
+
+// A function-backed service has no shared transport; a container-backed one
+// keeps its own.
+func TestReverseProxy_FunctionServiceHasNoSharedTransport(t *testing.T) {
+	if base := newReverseProxy(SchemeLambda, newBackendPool(), discardLogger(), nil, nil).Transport.(*poolTransport).base; base != nil {
+		t.Errorf("lambda service base transport = %T, want nil", base)
+	}
+	if base := newReverseProxy("http", newBackendPool(), discardLogger(), nil, nil).Transport.(*poolTransport).base; base == nil {
+		t.Error("http service base transport = nil")
+	}
+}
+
+func TestManager_RegisterFunctionWithoutInvokerIsRefused(t *testing.T) {
+	fake := newFakeListenSvc()
+	m := newTestManager(fake)
+	defer m.Close()
+	if err := m.RegisterFunction(fnHello, &FunctionDef{Service: "svc:hello"}); err == nil {
+		t.Fatal("RegisterFunction without an invoker succeeded")
+	}
+	if n := fake.listenCount("svc:hello"); n != 0 {
+		t.Errorf("ListenService calls = %d, want 0", n)
+	}
+}
+
+// Log lines for function backends name the function, so members of one pool
+// can be told apart as they join and leave.
+func TestManager_FunctionBackendLogsNameTheFunction(t *testing.T) {
+	fake := newFakeListenSvc()
+	var buf bytes.Buffer
+	m := newTestManager(fake)
+	m.logger = slog.New(slog.NewTextHandler(&buf, nil))
+
+	for _, arn := range []string{fnHello, fnHi} {
+		if err := m.RegisterFunction(arn, functionDef("svc:fn", arn, "")); err != nil {
+			t.Fatalf("RegisterFunction %s: %v", arn, err)
+		}
+	}
+	m.Deregister(fnHello)
+	m.Deregister(fnHi)
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	for _, tc := range []struct{ msg, key, backend string }{
+		{`msg="service advertised"`, "key=hello", "backend=lambda://" + fnHello},
+		{`msg="backend joined service"`, "key=hi", "backend=lambda://" + fnHi},
+		{`msg="backend left service"`, "key=hello", "backend=lambda://" + fnHello},
+		{`msg="service withdrawn; last backend left"`, "key=hi", "backend=lambda://" + fnHi},
+	} {
+		found := false
+		for _, l := range lines {
+			if strings.Contains(l, tc.msg) {
+				found = true
+				if !strings.Contains(l, " "+tc.key+" ") || !strings.Contains(l, tc.backend+" ") {
+					t.Errorf("%s line = %q, want %s and %s", tc.msg, l, tc.key, tc.backend)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("no %s line\n--- log ---\n%s", tc.msg, buf.String())
+		}
+	}
+}
+
+func TestShort(t *testing.T) {
+	for in, want := range map[string]string{
+		fnHello: "hello",
+		"arn:aws:ecs:us-east-1:111122223333:task/cluster/0123456789abcdef": "0123456789ab",
+		"0123456789abcdef0123": "0123456789ab",
+		"cid0":                 "cid0",
+	} {
+		if got := short(in); got != want {
+			t.Errorf("short(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

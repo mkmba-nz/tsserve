@@ -44,17 +44,16 @@ defined in the Tailscale admin console.
 | `tsserve.port` | yes | — | Container port to proxy to. |
 | `tsserve.network` | no | `bridge` | Docker network for IP resolution. |
 | `tsserve.scheme` | no | `http` | `http` or `https` for the backend. |
-| `tsserve.caps` | no | — | Comma-separated app capability names. Also enables node identity headers (see below). |
+| `tsserve.caps` | no | — | Comma-separated app capability names. |
 
-When `tsserve.caps` is set, tsserve additionally resolves each connecting peer
-(in-process `whois`) and, for **tagged nodes**, injects two headers so the
-backend can do per-device accounting/routing:
+On every request tsserve resolves the connecting peer (in-process `whois`) and
+injects node identity headers so the backend can tell devices apart:
 
+- `Tailscale-Node-Name` — the node's hostname (`ComputedName`), for every node,
+  user-owned or tagged.
 - `Tailscale-Node-Tags` — the node's ACL tags, comma-separated, `tag:` prefix
-  stripped (e.g. `github-runner,prod`).
-- `Tailscale-Node-Name` — the node's hostname (`ComputedName`).
-
-Untagged (user) nodes get neither header. Both headers are stripped from inbound
+  stripped (e.g. `github-runner,prod`), for tagged nodes only.
+ Both headers are stripped from inbound
 requests before forwarding, so clients cannot spoof them.
 
 ## Environment variables
