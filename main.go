@@ -285,7 +285,7 @@ type registrarAdapter struct {
 }
 
 func (a *registrarAdapter) Register(containerID string, def *labels.ServiceDef, backendIP string) error {
-	err := a.mgr.Register(containerID, &proxy.ServiceDef{
+	err := a.mgr.RegisterHostPort(containerID, &proxy.ServiceDef{
 		Service: def.Service,
 		Port:    def.Port,
 		Network: def.Network,

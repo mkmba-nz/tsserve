@@ -43,8 +43,8 @@ func poolOf(addrs ...string) *backendPool {
 
 // newSingleBackendProxy builds a reverse proxy for a service with exactly one
 // backend, the shape most of these tests exercise.
-func newSingleBackendProxy(scheme, backendIP string, port uint16, logger *slog.Logger, onError func(reason string), injectNode bool, whois whoisFunc) *httputil.ReverseProxy {
-	return newReverseProxy(scheme, poolOf(net.JoinHostPort(backendIP, strconv.Itoa(int(port)))), logger, onError, injectNode, whois)
+func newSingleBackendProxy(scheme, backendIP string, port uint16, logger *slog.Logger, onError func(reason string), whois whoisFunc) *httputil.ReverseProxy {
+	return newReverseProxy(scheme, poolOf(net.JoinHostPort(backendIP, strconv.Itoa(int(port)))), logger, onError, whois)
 }
 
 // closedPort binds and immediately releases a port, so connects to it are
@@ -108,7 +108,7 @@ func TestReverseProxy_ForwardsRequestAndHeaders(t *testing.T) {
 	defer backend.Close()
 
 	host, port := hostPort(t, backend.URL)
-	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, false, nil)
+	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/foo/bar", strings.NewReader("body"))
 	req.Host = "svc.example.ts.net"
@@ -152,7 +152,7 @@ func TestReverseProxy_PreservesUpstreamXForwardedFor(t *testing.T) {
 	defer backend.Close()
 
 	host, port := hostPort(t, backend.URL)
-	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, false, nil)
+	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("X-Forwarded-For", "100.64.0.42") // simulated upstream peer IP
@@ -175,7 +175,7 @@ func TestReverseProxy_DoesNotAddLoopbackXForwardedFor(t *testing.T) {
 	defer backend.Close()
 
 	host, port := hostPort(t, backend.URL)
-	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, false, nil)
+	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	// No X-Forwarded-For on the inbound request. RemoteAddr is whatever
@@ -202,7 +202,7 @@ func TestReverseProxy_ConnectionRefused_502AndErrorClassified(t *testing.T) {
 	rp := newSingleBackendProxy("http", host, port, discardLogger(), func(reason string) {
 		calls.Add(1)
 		lastReason.Store(reason)
-	}, false, nil)
+	}, nil)
 
 	rr := httptest.NewRecorder()
 	rp.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -225,7 +225,7 @@ func TestReverseProxy_HTTPSBackendSkipsTLSVerify(t *testing.T) {
 	defer backend.Close()
 
 	host, port := hostPort(t, backend.URL)
-	rp := newSingleBackendProxy("https", host, port, discardLogger(), nil, false, nil)
+	rp := newSingleBackendProxy("https", host, port, discardLogger(), nil, nil)
 
 	rr := httptest.NewRecorder()
 	rp.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -252,7 +252,7 @@ func TestReverseProxy_HTTPSBackendSkipsTLSVerify(t *testing.T) {
 
 func TestReverseProxy_OnErrorNilIsSafe(t *testing.T) {
 	// onError == nil must not panic.
-	rp := newSingleBackendProxy("http", "127.0.0.1", 1, discardLogger(), nil, false, nil)
+	rp := newSingleBackendProxy("http", "127.0.0.1", 1, discardLogger(), nil, nil)
 	rr := httptest.NewRecorder()
 	rp.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rr.Code != http.StatusBadGateway {
@@ -313,12 +313,12 @@ func nodeHeaderBackend(t *testing.T) (host string, port uint16, got func() (tags
 	return h, p, func() (string, string) { return gotTags, gotName }
 }
 
-// When injectNode is on and the peer resolves to a tagged node, the backend sees
-// Tailscale-Node-Tags (tag: prefix stripped) and Tailscale-Node-Name.
+// When the peer resolves to a tagged node, the backend sees Tailscale-Node-Tags
+// (tag: prefix stripped) and Tailscale-Node-Name.
 func TestReverseProxy_InjectsNodeHeadersForTaggedPeer(t *testing.T) {
 	host, port, got := nodeHeaderBackend(t)
 
-	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, true,
+	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil,
 		taggedWhois("runner-01", "tag:github-runner", "tag:prod"))
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -334,15 +334,16 @@ func TestReverseProxy_InjectsNodeHeadersForTaggedPeer(t *testing.T) {
 	}
 }
 
-// An untagged peer gets no node headers, and any client-supplied (spoofed) node
-// headers are stripped before forwarding.
-func TestReverseProxy_StripsSpoofedNodeHeadersForUntaggedPeer(t *testing.T) {
+// An untagged (user-owned) peer gets Tailscale-Node-Name and no
+// Tailscale-Node-Tags, and client-supplied (spoofed) values of both are
+// replaced or stripped before forwarding.
+func TestReverseProxy_UntaggedPeerGetsNodeNameOnly(t *testing.T) {
 	host, port, got := nodeHeaderBackend(t)
 
 	untagged := func(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error) {
 		return &apitype.WhoIsResponse{Node: &tailcfg.Node{ComputedName: "laptop"}}, nil
 	}
-	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, true, untagged)
+	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, untagged)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("X-Forwarded-For", "100.64.0.42")
@@ -350,8 +351,8 @@ func TestReverseProxy_StripsSpoofedNodeHeadersForUntaggedPeer(t *testing.T) {
 	req.Header.Set(headerNodeName, "evil")
 	rp.ServeHTTP(httptest.NewRecorder(), req)
 
-	if gotTags, gotName := got(); gotTags != "" || gotName != "" {
-		t.Errorf("node headers leaked: tags=%q name=%q, want both empty", gotTags, gotName)
+	if gotTags, gotName := got(); gotTags != "" || gotName != "laptop" {
+		t.Errorf("node headers: tags=%q name=%q, want tags empty and name %q", gotTags, gotName, "laptop")
 	}
 }
 
@@ -363,11 +364,12 @@ func TestReverseProxy_StripsNodeHeadersWhenWhoisFails(t *testing.T) {
 	failing := func(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error) {
 		return nil, errors.New("peer not found")
 	}
-	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, true, failing)
+	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, failing)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("X-Forwarded-For", "100.64.0.42")
 	req.Header.Set(headerNodeTags, "tag:admin")
+	req.Header.Set(headerNodeName, "evil")
 	rp.ServeHTTP(httptest.NewRecorder(), req)
 
 	if gotTags, gotName := got(); gotTags != "" || gotName != "" {
@@ -375,34 +377,17 @@ func TestReverseProxy_StripsNodeHeadersWhenWhoisFails(t *testing.T) {
 	}
 }
 
-// With injectNode off, node headers pass through untouched: tsserve does not
-// strip or inject them when a service has not opted in.
-func TestReverseProxy_NoInjectionWhenDisabled(t *testing.T) {
-	host, port, got := nodeHeaderBackend(t)
-
-	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, false,
-		taggedWhois("runner-01", "tag:github-runner"))
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Header.Set("X-Forwarded-For", "100.64.0.42")
-	req.Header.Set(headerNodeTags, "passthrough")
-	rp.ServeHTTP(httptest.NewRecorder(), req)
-
-	if gotTags, _ := got(); gotTags != "passthrough" {
-		t.Errorf("Tailscale-Node-Tags = %q, want passthrough (untouched when disabled)", gotTags)
-	}
-}
-
-// injectNode on but a nil whois (no LocalClient): headers are still stripped, but
-// none are injected.
+// With a nil whois (no LocalClient), headers are still stripped, but none are
+// injected.
 func TestReverseProxy_NilWhoisStripsButDoesNotInject(t *testing.T) {
 	host, port, got := nodeHeaderBackend(t)
 
-	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, true, nil)
+	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("X-Forwarded-For", "100.64.0.42")
 	req.Header.Set(headerNodeTags, "tag:admin")
+	req.Header.Set(headerNodeName, "evil")
 	rp.ServeHTTP(httptest.NewRecorder(), req)
 
 	if gotTags, gotName := got(); gotTags != "" || gotName != "" {
@@ -416,7 +401,7 @@ func TestReverseProxy_RoundRobinsAcrossPool(t *testing.T) {
 	addrA, hitsA := countingBackend(t)
 	addrB, hitsB := countingBackend(t)
 
-	rp := newReverseProxy("http", poolOf(addrA, addrB), discardLogger(), nil, false, nil)
+	rp := newReverseProxy("http", poolOf(addrA, addrB), discardLogger(), nil, nil)
 
 	seen := make([]string, 0, 4)
 	for i := 0; i < 4; i++ {
@@ -451,7 +436,7 @@ func TestReverseProxy_RetriesBodylessRequestOnConnectFailure(t *testing.T) {
 	rp := newReverseProxy("http", poolOf(dead, live), discardLogger(), func(reason string) {
 		errCalls.Add(1)
 		lastReason.Store(reason)
-	}, false, nil)
+	}, nil)
 
 	rr := httptest.NewRecorder()
 	rp.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -482,7 +467,7 @@ func TestReverseProxy_DoesNotRetryRequestWithBody(t *testing.T) {
 	var errCalls atomic.Int32
 	rp := newReverseProxy("http", poolOf(dead, live), discardLogger(), func(string) {
 		errCalls.Add(1)
-	}, false, nil)
+	}, nil)
 
 	rr := httptest.NewRecorder()
 	rp.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/", strings.NewReader("payload")))
@@ -516,7 +501,7 @@ func TestReverseProxy_DoesNotRetryBackendErrorResponse(t *testing.T) {
 	var errCalls atomic.Int32
 	rp := newReverseProxy("http", poolOf(failURL.Host, live), discardLogger(), func(string) {
 		errCalls.Add(1)
-	}, false, nil)
+	}, nil)
 
 	rr := httptest.NewRecorder()
 	rp.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -541,7 +526,7 @@ func TestReverseProxy_AllBackendsFail502CountsEachAttemptOnce(t *testing.T) {
 	var errCalls atomic.Int32
 	rp := newReverseProxy("http", pool, discardLogger(), func(string) {
 		errCalls.Add(1)
-	}, false, nil)
+	}, nil)
 
 	rr := httptest.NewRecorder()
 	rp.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -560,7 +545,7 @@ func TestReverseProxy_PoolChangesTakeEffectPerRequest(t *testing.T) {
 	second, secondHits := countingBackend(t)
 
 	pool := poolOf(first)
-	rp := newReverseProxy("http", pool, discardLogger(), nil, false, nil)
+	rp := newReverseProxy("http", pool, discardLogger(), nil, nil)
 
 	rr := httptest.NewRecorder()
 	rp.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -599,7 +584,7 @@ func TestReverseProxy_EmptyPoolReturns502(t *testing.T) {
 	rp := newReverseProxy("http", newBackendPool(), discardLogger(), func(r string) {
 		errCalls.Add(1)
 		reason.Store(r)
-	}, false, nil)
+	}, nil)
 
 	rr := httptest.NewRecorder()
 	rp.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -620,7 +605,7 @@ func TestReverseProxy_EmptyPoolReturns502(t *testing.T) {
 func TestReverseProxy_ConcurrentRequestsAllServed(t *testing.T) {
 	addrA, hitsA := countingBackend(t)
 	addrB, hitsB := countingBackend(t)
-	rp := newReverseProxy("http", poolOf(addrA, addrB), discardLogger(), nil, false, nil)
+	rp := newReverseProxy("http", poolOf(addrA, addrB), discardLogger(), nil, nil)
 
 	const N = 60
 	var wg sync.WaitGroup
@@ -660,7 +645,7 @@ func TestReverseProxy_StopsRetryingWhenClientContextDone(t *testing.T) {
 	rp := newReverseProxy("http", poolOf(dead, live), discardLogger(), func(string) {
 		errCalls.Add(1)
 		cancelOnFirstError()
-	}, false, nil)
+	}, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	// Cancel from the first attempt's failure callback: the client goes away
@@ -708,7 +693,7 @@ func TestReverseProxy_RetriesOnTLSHandshakeFailure(t *testing.T) {
 	var errCalls atomic.Int32
 	rp := newReverseProxy("https", poolOf(plainURL.Host, tlsURL.Host), discardLogger(), func(string) {
 		errCalls.Add(1)
-	}, false, nil)
+	}, nil)
 
 	rr := httptest.NewRecorder()
 	rp.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -735,7 +720,7 @@ func TestReverseProxy_RetriedRequestRecordsActualResponseCode(t *testing.T) {
 
 	rp := newReverseProxy("http", poolOf(closedPort(t), live), discardLogger(), func(reason string) {
 		mc.Errors.WithLabelValues("svc:web", reason).Inc()
-	}, false, nil)
+	}, nil)
 	handler := mc.Middleware("svc:web", rp)
 
 	rr := httptest.NewRecorder()
@@ -762,7 +747,7 @@ func TestReverseProxy_ErrorLogNamesEachBackendTried(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 
-	rp := newReverseProxy("http", poolOf(first, second), logger, nil, false, nil)
+	rp := newReverseProxy("http", poolOf(first, second), logger, nil, nil)
 	rr := httptest.NewRecorder()
 	rp.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rr.Code != http.StatusBadGateway {
@@ -879,7 +864,7 @@ func TestReverseProxy_UpgradedConnectionSurvivesBackendLeavingPool(t *testing.T)
 	defer backend.Close()
 
 	pool := poolOf(backend.Listener.Addr().String())
-	front := httptest.NewServer(newReverseProxy("http", pool, discardLogger(), nil, false, nil))
+	front := httptest.NewServer(newReverseProxy("http", pool, discardLogger(), nil, nil))
 	defer front.Close()
 
 	conn, err := net.Dial("tcp", front.Listener.Addr().String())

@@ -15,9 +15,10 @@ import (
 	"tailscale.com/client/tailscale/apitype"
 )
 
-// Node identity headers tsserve injects for tagged peers when a service opts in
-// (i.e. when tsserve.caps is set). Both are stripped from inbound requests
-// before forwarding so a client cannot spoof them.
+// Node identity headers tsserve injects on every proxied request:
+// Tailscale-Node-Name for every resolved peer, user-owned or tagged, and
+// Tailscale-Node-Tags when the peer is tagged. Both are stripped from inbound
+// requests before forwarding so a client cannot spoof them.
 const (
 	headerNodeTags = "Tailscale-Node-Tags"
 	headerNodeName = "Tailscale-Node-Name"
@@ -58,18 +59,25 @@ var errNoBackend = errors.New("no backend registered for service")
 // certs — and is shared by every pool member.
 //
 // onError, if non-nil, is invoked with a short reason classification ("timeout",
-// "connection-refused", "other") once per failed attempt. When every attempt
-// fails the HTTP response is a 502, exactly as before.
+// "connection-refused", "function-error", "throttled", "other", ...) once per
+// failed attempt. When every attempt fails the HTTP response is a 502.
 //
-// When injectNode is true the proxy resolves the connecting peer via whois and,
-// for tagged nodes, injects the Tailscale-Node-Tags and Tailscale-Node-Name
-// headers. Those headers are always stripped from the inbound request first, so
-// a client cannot spoof them regardless of whois resolution. whois may be nil:
+// The proxy resolves the connecting peer via whois and injects
+// Tailscale-Node-Name for every resolved peer and Tailscale-Node-Tags for tagged
+// ones. Those headers are always stripped from the inbound request first, so a
+// client cannot spoof them regardless of whois resolution. whois may be nil:
 // the headers are still stripped, but none are injected.
-func newReverseProxy(scheme string, pool *backendPool, logger *slog.Logger, onError func(reason string), injectNode bool, whois whoisFunc) *httputil.ReverseProxy {
+//
+// A function-backed service has no shared transport: each attempt is performed
+// by the chosen member's invoker.
+func newReverseProxy(scheme string, pool *backendPool, logger *slog.Logger, onError func(reason string), whois whoisFunc) *httputil.ReverseProxy {
+	var base http.RoundTripper
+	if scheme != SchemeLambda {
+		base = newBackendTransport(scheme)
+	}
 	rp := &httputil.ReverseProxy{
 		Transport: &poolTransport{
-			base:    newBackendTransport(scheme),
+			base:    base,
 			pool:    pool,
 			scheme:  scheme,
 			logger:  logger,
@@ -95,9 +103,7 @@ func newReverseProxy(scheme string, pool *backendPool, logger *slog.Logger, onEr
 			pr.Out.Header.Set("X-Forwarded-Host", pr.In.Host)
 			pr.Out.Header.Set("X-Forwarded-Proto", "https")
 
-			if injectNode {
-				injectNodeHeaders(pr, logger, whois)
-			}
+			injectNodeHeaders(pr, logger, whois)
 		},
 	}
 
@@ -155,17 +161,24 @@ func (t *poolTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// not that of the first candidate — and the RoundTripper contract
 		// forbids modifying the request we were given, which ReverseProxy still
 		// holds (it passes it to ErrorHandler and to the protocol-upgrade path).
+		// A function backend has no host of its own, so its invoker receives
+		// the host the client addressed.
 		attempt := req.Clone(req.Context())
-		attempt.URL.Scheme = t.scheme
-		attempt.URL.Host = b.addr
-		attempt.Host = b.addr
+		rt := t.base
+		if b.invoker != nil {
+			rt = b.invoker
+		} else {
+			attempt.URL.Scheme = t.scheme
+			attempt.URL.Host = b.addr
+			attempt.Host = b.addr
+		}
 
-		resp, err := t.base.RoundTrip(attempt)
+		resp, err := rt.RoundTrip(attempt)
 		if err == nil {
 			return resp, nil
 		}
 
-		t.logger.Warn("backend proxy error", "target", backendURL(t.scheme, b.addr), "err", err)
+		t.logger.Warn("backend proxy error", "target", b.targetURL(t.scheme), "err", err)
 		if t.onError != nil {
 			t.onError(classifyProxyError(err))
 		}
@@ -215,15 +228,7 @@ func (t *poolTransport) CloseIdleConnections() {
 // failure — dial refused, dial timeout, no route, DNS failure and, for https, a
 // failed TLS handshake — in a connectError so poolTransport can recognise them.
 func newBackendTransport(scheme string) *http.Transport {
-	dialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
-	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		c, err := dialer.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, &connectError{err: err}
-		}
-		return c, nil
-	}
-
+	dial := connectDialer()
 	tr := &http.Transport{
 		// Unchanged from the transports this replaced: the http path came from
 		// http.DefaultTransport, which honours the proxy environment, and the
@@ -251,7 +256,28 @@ func newBackendTransport(scheme string) *http.Transport {
 	// it to the Transport reliably keeps the failure inside a connectError, and
 	// keeps these backends on HTTP/1.1 as before.
 	tr.Proxy = nil
-	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+	tr.DialTLSContext = dialTLSWithin(dial, tlsCfg)
+	return tr
+}
+
+// connectDialer returns a dial function bounded by dialTimeout that wraps every
+// failure in a connectError.
+func connectDialer() func(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, &connectError{err: err}
+		}
+		return c, nil
+	}
+}
+
+// dialTLSWithin returns a DialTLSContext hook that dials with dial and
+// handshakes with tlsCfg inside one dialTimeout budget, wrapping a failed
+// handshake in a connectError.
+func dialTLSWithin(dial func(ctx context.Context, network, addr string) (net.Conn, error), tlsCfg *tls.Config) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		// One budget covers dial and handshake together, so an https attempt is
 		// bounded by the same few seconds as a plain one even against a host
 		// that accepts the connection and then stalls.
@@ -277,13 +303,14 @@ func newBackendTransport(scheme string) *http.Transport {
 		}
 		return tc, nil
 	}
-	return tr
 }
 
 // injectNodeHeaders strips any inbound node-identity headers (spoof prevention)
-// and, for tagged peers, replaces them with values resolved via whois. The peer
-// IP comes from X-Forwarded-For, which the Tailscale serve layer sets to the
-// peer's tailnet IP; pr.In.RemoteAddr is the loopback socket and useless here.
+// and replaces them with values resolved via whois: Tailscale-Node-Name for
+// every peer, Tailscale-Node-Tags for tagged ones.
+// The peer IP comes from X-Forwarded-For, which the Tailscale serve layer sets
+// to the peer's tailnet IP; pr.In.RemoteAddr is the loopback socket and useless
+// here.
 func injectNodeHeaders(pr *httputil.ProxyRequest, logger *slog.Logger, whois whoisFunc) {
 	// Always strip first so a client-supplied value never survives, even when
 	// the node is untagged or whois fails.
@@ -307,11 +334,12 @@ func injectNodeHeaders(pr *httputil.ProxyRequest, logger *slog.Logger, whois who
 		logger.Debug("whois lookup failed; not injecting node headers", "ip", ip, "err", err)
 		return
 	}
-	if resp == nil || resp.Node == nil || !resp.Node.IsTagged() {
+	if resp == nil || resp.Node == nil {
 		return
 	}
-
-	pr.Out.Header.Set(headerNodeTags, formatNodeTags(resp.Node.Tags))
+	if resp.Node.IsTagged() {
+		pr.Out.Header.Set(headerNodeTags, formatNodeTags(resp.Node.Tags))
+	}
 	pr.Out.Header.Set(headerNodeName, resp.Node.ComputedName)
 }
 
@@ -343,6 +371,13 @@ func classifyProxyError(err error) string {
 	}
 	if errors.Is(err, errNoBackend) {
 		return "no-backend"
+	}
+	var fe *functionError
+	if errors.As(err, &fe) {
+		return "function-error"
+	}
+	if isThrottle(err) {
+		return "throttled"
 	}
 	s := err.Error()
 	switch {

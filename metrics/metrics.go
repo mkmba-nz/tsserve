@@ -69,7 +69,7 @@ func New() *Collector {
 		}, []string{"service"}),
 		Errors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tsserve_proxy_backend_errors_total",
-			Help: "Failed attempts against a backend, by service and reason. One increment per attempt, so a request retried against a second backend can contribute more than one.",
+			Help: "Failed attempts against a backend, by service and reason. One increment per attempt, so a request retried against a second backend can contribute more than one. Reasons: timeout, connection-refused, dns, eof, no-backend, function-error, throttled, other.",
 		}, []string{"service", "reason"}),
 		Active: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "tsserve_services_active",

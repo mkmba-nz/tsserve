@@ -22,7 +22,7 @@ import (
 	"mkmba.nz/tsserve/metrics"
 )
 
-// FatalError is returned by [Manager.Register] when a configuration problem
+// FatalError is returned by [Manager.RegisterHostPort] and [Manager.RegisterFunction] when a configuration problem
 // makes further service registration pointless (for example HTTPS or MagicDNS
 // being disabled in the admin console). Callers should propagate it and exit.
 type FatalError struct{ err error }
@@ -30,7 +30,7 @@ type FatalError struct{ err error }
 func (e *FatalError) Error() string { return e.err.Error() }
 func (e *FatalError) Unwrap() error { return e.err }
 
-// ConflictError is returned by [Manager.Register] when a backend's
+// ConflictError is returned by [Manager.RegisterHostPort] and [Manager.RegisterFunction] when a backend's
 // service-level labels disagree with the service that is already advertised
 // under that name. The backend is refused: it joins no pool and is recorded
 // nowhere in the manager. Callers can distinguish it from a listen failure and
@@ -61,7 +61,7 @@ func (e *ConflictError) Error() string {
 		e.Key, e.Service, e.Field, e.Offered, e.Field, e.Advertised)
 }
 
-// errShuttingDown is returned by Register once Close has run.
+// errShuttingDown is returned by a registration once Close has run.
 var errShuttingDown = errors.New("manager is shutting down")
 
 // Manager owns the tsnet.Server and the live set of advertised Tailscale
@@ -107,7 +107,7 @@ type advertisedService struct {
 	pool *backendPool
 
 	// A record is in exactly one of three states, all guarded by Manager.mu, and
-	// a Register that finds the name occupied waits for whichever transition is
+	// a registration that finds the name occupied waits for whichever transition is
 	// in flight rather than opening a second listener for it:
 	//
 	//	advertising  ready == false            -> wait on advertised
@@ -115,7 +115,7 @@ type advertisedService struct {
 	//	withdrawing  withdrawing != nil        -> wait on withdrawing
 	//
 	// Both waits matter to correctness. tsnet refuses ListenService while a
-	// handler for the service's port is still in the serve config, so a Register
+	// handler for the service's port is still in the serve config, so a registration
 	// that opened a listener before the outgoing one had finished closing would
 	// fail outright, leaving the service dark until discovery came round again.
 	ready bool
@@ -141,7 +141,9 @@ type ServiceView struct {
 
 // BackendView is one member of an advertised service's backend pool.
 type BackendView struct {
-	// Backend is the full address a request is proxied to, "scheme://host:port".
+	// Backend is the target a request is proxied to: "scheme://host:port" for
+	// a container backend, "lambda://<function ARN>[:<qualifier>]" for a
+	// function backend.
 	Backend string
 	// Key is the watcher-supplied registration key.
 	Key          string
@@ -191,7 +193,7 @@ type Origin struct {
 	Region  string
 }
 
-// Register adds backendIP:def.Port to the backend pool of def.Service,
+// RegisterHostPort adds backendIP:def.Port to the backend pool of def.Service,
 // advertising the service (opening its Tailscale Service listener) if this is
 // its first backend. It is idempotent over the registration key: repeat calls
 // for a key already in a pool are a no-op.
@@ -202,14 +204,57 @@ type Origin struct {
 // backend's labels disagree with the advertised service, and a plain error when
 // the listener could not be opened. Callers are expected to retry the latter
 // two on their next discovery cycle rather than record the backend as active.
-func (m *Manager) Register(key string, def *ServiceDef, backendIP string) error {
-	b := &backend{
+func (m *Manager) RegisterHostPort(key string, def *ServiceDef, backendIP string) error {
+	return m.register(key, def, &backend{
 		key:          key,
 		addr:         net.JoinHostPort(backendIP, strconv.Itoa(int(def.Port))),
 		registeredAt: time.Now(),
 		origin:       def.Origin,
-	}
+	})
+}
 
+// SchemeLambda is the scheme of an advertised service backed by functions. It
+// is internal: no container label or function tag can name it, so the scheme
+// comparison in conflictWith keeps every pool homogeneous — a container backend
+// is refused by a function-backed service and a function by a container-backed
+// one.
+const SchemeLambda = "lambda"
+
+// FunctionDef describes a function backend: a Lambda function registered
+// against an advertised service. It has no address; every request to it is
+// performed by Invoker, whose Target names it in logs and on the status page.
+type FunctionDef struct {
+	Service string
+	Caps    []string
+	Origin  Origin
+	Invoker *FunctionInvoker
+}
+
+// RegisterFunction adds a function backend to the pool of def.Service,
+// advertising the service with the lambda scheme if this is its first backend.
+// Its contract — idempotence over key, the errors returned, and what a nil
+// return means — is RegisterHostPort's.
+func (m *Manager) RegisterFunction(key string, def *FunctionDef) error {
+	if def.Invoker == nil {
+		return fmt.Errorf("function backend %s has no invoker", key)
+	}
+	return m.register(key, &ServiceDef{
+		Service: def.Service,
+		Scheme:  SchemeLambda,
+		Caps:    def.Caps,
+		Origin:  def.Origin,
+	}, &backend{
+		key:          key,
+		registeredAt: time.Now(),
+		origin:       def.Origin,
+		invoker:      def.Invoker,
+		target:       def.Invoker.Target(),
+	})
+}
+
+// register adds b to the pool of def.Service; see RegisterHostPort. Only def's
+// service-level fields (Service, Scheme, Caps) are read.
+func (m *Manager) register(key string, def *ServiceDef, b *backend) error {
 	for {
 		m.mu.Lock()
 		if m.shutdown {
@@ -224,7 +269,7 @@ func (m *Manager) Register(key string, def *ServiceDef, backendIP string) error 
 		rec, occupied := m.services[def.Service]
 		if !occupied {
 			// First backend for this name: claim it before releasing the lock so
-			// a concurrent Register waits for our listener instead of opening a
+			// a concurrent registration waits for our listener instead of opening a
 			// second one.
 			rec = &advertisedService{
 				name:       def.Service,
@@ -259,7 +304,7 @@ func (m *Manager) Register(key string, def *ServiceDef, backendIP string) error 
 
 		m.logger.Info("backend joined service",
 			"service", rec.name,
-			"backend", backendURL(rec.scheme, b.addr),
+			"backend", b.targetURL(rec.scheme),
 			"key", short(key),
 			"pool_size", size)
 		return nil
@@ -299,15 +344,11 @@ func (m *Manager) advertise(rec *advertisedService, key string, b *backend) erro
 		onError = func(reason string) { errs.WithLabelValues(reason).Inc() }
 	}
 
-	// Node-header injection rides on the same opt-in as app capabilities: when a
-	// service requests caps, tsserve also resolves the connecting peer and
-	// injects Tailscale-Node-Tags/Name for tagged nodes.
-	injectNode := len(rec.caps) > 0
 	// Scope the proxy's logger to this service: its error lines have no single
 	// backend to name (an empty pool, a protocol upgrade that failed after the
 	// response began), so the service is what makes them attributable.
 	svcLogger := m.logger.With("service", rec.name)
-	rp := newReverseProxy(rec.scheme, rec.pool, svcLogger, onError, injectNode, m.whois)
+	rp := newReverseProxy(rec.scheme, rec.pool, svcLogger, onError, m.whois)
 	var handler http.Handler = rp
 	handler = m.metrics.Middleware(rec.name, handler)
 
@@ -357,7 +398,7 @@ func (m *Manager) advertise(rec *advertisedService, key string, b *backend) erro
 
 	m.logger.Info("service advertised",
 		"service", rec.name,
-		"backend", backendURL(rec.scheme, b.addr),
+		"backend", b.targetURL(rec.scheme),
 		"caps", rec.caps,
 		"key", short(key),
 		"pool_size", size)
@@ -383,7 +424,7 @@ func (l *serialisedListener) Close() error {
 }
 
 // abandon releases a claim on a service name whose listener could not be
-// opened, waking any Register waiting on it.
+// opened, waking any registration waiting on it.
 func (m *Manager) abandon(rec *advertisedService) {
 	m.mu.Lock()
 	m.releaseLocked(rec)
@@ -484,15 +525,21 @@ func (m *Manager) Deregister(key string) {
 		m.mu.Unlock()
 		return
 	}
+	var target string
+	for _, b := range rec.pool.list() {
+		if b.key == key {
+			target = b.targetURL(rec.scheme)
+		}
+	}
 	size := rec.pool.remove(key)
 	if size > 0 {
 		m.setPoolSize(name, size)
 		m.mu.Unlock()
-		m.logger.Info("backend left service", "service", name, "key", short(key), "pool_size", size)
+		m.logger.Info("backend left service", "service", name, "backend", target, "key", short(key), "pool_size", size)
 		return
 	}
 	// The pool is empty: mark the record withdrawing and keep it in the index
-	// while the listener closes. A Register arriving now waits on that channel
+	// while the listener closes. A registration arriving now waits on that channel
 	// rather than calling ListenService, which tsnet would refuse while this
 	// service's handler is still in the serve config.
 	rec.withdrawing = make(chan struct{})
@@ -516,7 +563,7 @@ func (m *Manager) Deregister(key string) {
 	m.mu.Unlock()
 
 	m.logger.Info("service withdrawn; last backend left",
-		"service", name, "key", short(key), "pool_size", 0)
+		"service", name, "backend", target, "key", short(key), "pool_size", 0)
 }
 
 // Snapshot returns a defensive copy of the advertised service set, sorted by
@@ -528,7 +575,7 @@ func (m *Manager) Snapshot() []ServiceView {
 	for _, rec := range m.services {
 		if !rec.ready || rec.withdrawing != nil {
 			// Either the listener is still being opened, or the pool has
-			// emptied and the record is only still here so a racing Register
+			// emptied and the record is only still here so a racing registration
 			// waits for the listener to close. Neither has a backend to show,
 			// and every ServiceView is meant to carry at least one.
 			continue
@@ -537,7 +584,7 @@ func (m *Manager) Snapshot() []ServiceView {
 		backends := make([]BackendView, 0, len(members))
 		for _, b := range members {
 			backends = append(backends, BackendView{
-				Backend:      backendURL(rec.scheme, b.addr),
+				Backend:      b.targetURL(rec.scheme),
 				Key:          b.key,
 				RegisteredAt: b.registeredAt,
 				Origin:       b.origin,
@@ -634,6 +681,12 @@ func isMagicDNSError(err error) bool {
 }
 
 func short(id string) string {
+	// A Lambda function ARN has no path: log the whole function name, which
+	// is what tells two members of one pool apart, rather than the constant
+	// "arn:aws:lamb" prefix.
+	if _, fn, ok := strings.Cut(id, ":function:"); ok && strings.HasPrefix(id, "arn:") {
+		return fn
+	}
 	// Strip ARN-style path prefix so ECS task ARNs log their task UUID
 	// rather than the constant "arn:aws:ecs:" prefix.
 	if i := strings.LastIndexByte(id, '/'); i >= 0 {

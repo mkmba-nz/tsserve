@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net/http"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -15,9 +16,26 @@ type backend struct {
 	key string
 	// addr is the backend's "host:port", used verbatim as the outbound URL host
 	// and Host header. The scheme is a property of the advertised service.
+	// Empty for a function backend, which has no address of its own.
 	addr         string
 	registeredAt time.Time
 	origin       Origin
+
+	// invoker performs every request to a function backend, and target names
+	// it ("lambda://<function ARN>[:<qualifier>]"). Both are unset for a
+	// container backend, whose requests go through the service's shared
+	// transport to addr.
+	invoker http.RoundTripper
+	target  string
+}
+
+// targetURL renders where this backend's requests go, for logs and the status
+// page. scheme is the advertised service's.
+func (b *backend) targetURL(scheme string) string {
+	if b.invoker != nil {
+		return b.target
+	}
+	return backendURL(scheme, b.addr)
 }
 
 // backendPool is the ordered set of backends registered against one advertised
