@@ -1,22 +1,22 @@
 # tsserve — Specification
 
-A single-binary Docker-to-Tailscale-Services proxy built on `tsnet`.
+A single-binary proxy from Docker containers, ECS tasks and Lambda functions to Tailscale Services, built on `tsnet`.
 
 ## Overview
 
-`tsserve` watches Docker for labeled containers and exposes them as **Tailscale Services** (not machines) using the `tsnet` Go library's `ListenService` API. It runs as a single container or binary, registers once on the tailnet as a single node, and reverse-proxies traffic to backend containers. When containers start or stop, it creates or tears down the corresponding service listeners automatically.
+`tsserve` watches Docker for labeled containers — or the AWS ECS API for labeled tasks, or AWS for tagged Lambda functions — and exposes them as **Tailscale Services** (not machines) using the `tsnet` Go library's `ListenService` API. It runs as a single container or binary, registers once on the tailnet as a single node, and reverse-proxies traffic to the backends: containers reached at a host and port, or functions invoked through the Lambda API. When backends appear or disappear, it creates or tears down the corresponding service listeners automatically.
 
 ## Goals
 
 - **Single binary/container** — no external `tailscaled` daemon required. `tsnet` is compiled in.
 - **Tailscale Services, not machines** — uses `tsnet.Server.ListenService`, so the tailnet device list stays clean. Each backend gets its own `svc:` entry, not a machine.
 - **HTTPS by default** — all services are exposed over HTTPS with automatic TLS certificates from Let's Encrypt via Tailscale's built-in cert provisioning. Clients access services at `https://servicename.tailnet.ts.net`. This requires MagicDNS and HTTPS to be enabled in the Tailscale admin console.
-- **Flexible discovery** — labelled containers can be discovered via a local Docker socket (single-host deployments) or via the AWS ECS API (multi-host clusters where Tailscale must not run on the container hosts). The `tsserve.*` label vocabulary is identical across modes.
+- **Flexible discovery** — labelled containers can be discovered via a local Docker socket (single-host deployments) or via the AWS ECS API (multi-host clusters where Tailscale must not run on the container hosts), and tagged Lambda functions via the AWS Resource Groups Tagging API. Several discovery modes can run in one process. The `tsserve.*` vocabulary is shared across modes: container labels and function tags use the same keys, with the differences listed in [Lambda Function Backends](#lambda-function-backends).
 - **Minimal scope** — label-driven discovery, reverse proxying, lifecycle management. Nothing else.
 
 ## Non-goals
 
-- TOML/YAML config file provider (Docker labels only).
+- TOML/YAML config file provider (per-backend configuration comes only from container labels or function tags).
 - Headscale support (Tailscale Services require the Tailscale control plane).
 - Tailscale Funnel support.
 - Automatic service definition creation via the Tailscale API (users pre-create services in the admin console or configure ACL auto-approvers).
@@ -56,13 +56,13 @@ A single-binary Docker-to-Tailscale-Services proxy built on `tsnet`.
 └─────────────────────────────────────────────────────┘
 ```
 
-A single `tsnet.Server` instance registers on the tailnet. For each discovered container, `ListenService` is called to advertise a service, and a Go `httputil.ReverseProxy` handles the actual traffic forwarding to the container's IP on the Docker bridge network.
+A single `tsnet.Server` instance registers on the tailnet. For each discovered container, `ListenService` is called to advertise a service, and a Go `httputil.ReverseProxy` handles the actual traffic forwarding to the container's IP on the Docker bridge network. The diagram shows Docker mode; in [ECS Cluster Mode](#ecs-cluster-mode) the backends are task IPs in another VPC, and a [function backend](#lambda-function-backends) is not dialled at all — the proxy hands each request to an invoker that calls the Lambda API.
 
 ---
 
 ## Docker Labels
 
-All labels are prefixed with `tsserve.`.
+All labels are prefixed with `tsserve.`. The same keys label ECS task-definition containers ([Where labels live](#where-labels-live)) and, as AWS tags, Lambda functions ([Function tags](#function-tags)).
 
 ### Required
 
@@ -221,14 +221,19 @@ tsserve supports three authentication modes. The first matching mode wins, check
 | `TSSERVE_STATE_STORE` | No | — | Diverts **only** the node identity (`tailscaled.state`: machine/node key and prefs) to an external state store, leaving certs on disk under `TSSERVE_STATE_DIR`. Value is a `store.New` target — most usefully an AWS SSM parameter ARN, `arn:aws:ssm:<region>:<acct>:parameter/<name>[?kmsKey=<id>]`. Unset ⇒ identity is a `tailscaled.state` file under `TSSERVE_STATE_DIR`, as before. Pairs with `TSSERVE_CERT_S3_BUCKET` for a fully durable identity+certs setup on ephemeral filesystems. See [Node state store](#node-state-store). |
 | `TSSERVE_LOG_LEVEL` | No | `info` | Log level: `debug`, `info`, `warn`, `error`. |
 | **Discovery** | | | |
-| `TSSERVE_DISCOVERY` | No | `docker` | Discovery backend. `docker` reads `/var/run/docker.sock`. `ecs` queries the AWS ECS API. See [ECS Cluster Mode](#ecs-cluster-mode). |
-| `TSSERVE_ECS_CLUSTER` | ✱✱✱ | — | ECS cluster name or ARN to watch. Required when `TSSERVE_DISCOVERY=ecs`, unless every entry in `TSSERVE_ECS_ACCOUNTS` supplies its own `cluster`. In multi-account mode it is the shared default cluster. |
+| `TSSERVE_DISCOVERY` | No | `docker` | Comma-separated list of discovery modes, e.g. `ecs,lambda`. `docker` reads `/var/run/docker.sock`. `ecs` queries the AWS ECS API; see [ECS Cluster Mode](#ecs-cluster-mode). `lambda` discovers tagged Lambda functions; see [Lambda Function Backends](#lambda-function-backends). Every listed mode runs in the one process against the same set of services. Entries are matched case-insensitively and may carry surrounding whitespace; an unknown, empty or repeated entry is a startup error. |
+| `TSSERVE_ECS_CLUSTER` | ✱✱✱ | — | ECS cluster name or ARN to watch. Required when `TSSERVE_DISCOVERY` includes `ecs`, unless every entry in `TSSERVE_ECS_ACCOUNTS` supplies its own `cluster`. In multi-account mode it is the shared default cluster. |
 | `TSSERVE_ECS_ACCOUNTS` | No | — | JSON array of accounts to discover, one poller per entry, each with its own credential context. Unset ⇒ single-account mode using the vars below. See [Multiple AWS accounts](#multiple-aws-accounts). |
 | `TSSERVE_ECS_POLL_INTERVAL` | No | `10s` | How often to poll the ECS API for task changes. Go duration format. Applies to every account. |
 | `TSSERVE_ECS_RETRY_INTERVAL` | No | `2m` | Slower cadence used to retry an **unhealthy** reader (e.g. one whose role is not assumable yet). While a reader is failing it polls at this interval instead of `TSSERVE_ECS_POLL_INTERVAL`, so a single broken reader keeps retrying — and recovers automatically once fixed — without hammering the API or blocking the daemon. Never faster than the poll interval. |
 | `TSSERVE_ECS_AWS_PROFILE` | No | — | Shared-config profile to use **only** for the ECS discovery client. Set this instead of `AWS_PROFILE` so tsnet's WIF flow still resolves to the default (instance-role) identity Tailscale trusts. In multi-account mode it is the shared default profile. |
 | `TSSERVE_ECS_AWS_CONFIG_FILE` | No | — | Shared-config file path for the ECS discovery client only. Set this instead of `AWS_CONFIG_FILE` to keep the WIF credential chain clean. In multi-account mode it is the shared default config file. |
-| `AWS_REGION` | ✱✱✱ | — | Standard AWS env var. Required when `TSSERVE_DISCOVERY=ecs` if not derivable from instance metadata or IAM role. Safe to set process-wide — it does not affect identity. In multi-account mode it is the shared default region. |
+| `TSSERVE_LAMBDA_ACCOUNTS` | No | — | JSON array of accounts (or account-and-region pairs) to discover functions in, one Lambda reader per entry. Same fields as `TSSERVE_ECS_ACCOUNTS` minus `cluster`. Unset ⇒ one reader from the shared vars below. See [Multiple accounts and regions](#multiple-accounts-and-regions). |
+| `TSSERVE_LAMBDA_POLL_INTERVAL` | No | `30s` | How often each Lambda reader polls the Tagging API for tagged functions. Go duration format. Applies to every Lambda reader. |
+| `TSSERVE_LAMBDA_RETRY_INTERVAL` | No | `2m` | Slower cadence for an **unhealthy** Lambda reader, as `TSSERVE_ECS_RETRY_INTERVAL` is for ECS readers. Never faster than the poll interval. |
+| `TSSERVE_LAMBDA_AWS_PROFILE` | No | — | Shared-config profile used **only** by the Lambda readers' clients: Tagging and STS for discovery, and the Lambda client that invokes functions. Set this instead of `AWS_PROFILE`, for the same reason as `TSSERVE_ECS_AWS_PROFILE`. With `TSSERVE_LAMBDA_ACCOUNTS` it is the shared default profile. |
+| `TSSERVE_LAMBDA_AWS_CONFIG_FILE` | No | — | Shared-config file path for the Lambda readers' clients only. With `TSSERVE_LAMBDA_ACCOUNTS` it is the shared default config file. |
+| `AWS_REGION` | ✱✱✱ | — | Standard AWS env var. Required when `TSSERVE_DISCOVERY` includes `ecs` or `lambda`, unless every account entry supplies its own `region` or the region is derivable from instance metadata or the IAM role. Safe to set process-wide — it does not affect identity. In multi-account mode it is the shared default region, for ECS and Lambda readers alike. |
 | **Certificate cache** | | | |
 | `TSSERVE_CERT_S3_BUCKET` | No | — | Enables the S3-backed TLS certificate cache. When set, tsnet's on-disk cert cache (`<TSSERVE_STATE_DIR>/certs`) is restored from this bucket at startup and any cert tsnet provisions or renews is uploaded back. Intended for ephemeral filesystems (ECS/Fargate) so restarts reuse existing Let's Encrypt certs instead of re-running ACME. Unset ⇒ certs stay on local disk only, as before. See [TLS certificate cache](#tls-certificate-cache). |
 | `TSSERVE_CERT_S3_PREFIX` | No | — | Optional key prefix within the bucket (e.g. `tsserve/prod/`). Lets one bucket back multiple nodes. |
@@ -237,7 +242,7 @@ tsserve supports three authentication modes. The first matching mode wins, check
 | `TSSERVE_METRICS_ADDR` | No | `127.0.0.1:9090` | `host:port` for the loopback Prometheus listener that serves `/metrics`. Set to `""` to disable, or `0.0.0.0:9100` to expose to a remote scraper (the operator owns host-firewall enforcement in that case). |
 | `TSSERVE_TRAEFIK_PORT` | No | — | If set, the tailnet HTTPS listener proxies `/traefik` to `http://localhost:<port>`. Intended for reaching a co-located Traefik dashboard. Omit to disable. |
 
-✱ One authentication method must be provided. ✱✱ Required for OAuth and OIDC modes. ✱✱✱ Required when `TSSERVE_DISCOVERY=ecs`.
+✱ One authentication method must be provided. ✱✱ Required for OAuth and OIDC modes. ✱✱✱ Required when `TSSERVE_DISCOVERY` includes `ecs` (`TSSERVE_ECS_CLUSTER`, `AWS_REGION`) or `lambda` (`AWS_REGION`). Each mode's variables are read only when that mode is listed.
 
 ### ECS Deployment Example
 
@@ -297,7 +302,7 @@ tsnet handles the token exchange, key generation, and node registration internal
 
 ## ECS Cluster Mode
 
-When `TSSERVE_DISCOVERY=ecs`, tsserve discovers backends by querying the AWS ECS API instead of a local Docker socket. This is the deployment topology for clusters where Tailscale must not run on the container hosts.
+When `TSSERVE_DISCOVERY` includes `ecs`, tsserve discovers backends by querying the AWS ECS API rather than a local Docker socket (the two modes can also run side by side). This is the deployment topology for clusters where Tailscale must not run on the container hosts.
 
 ### When to use this mode
 
@@ -419,7 +424,8 @@ service in the **Services** table is likewise tagged with the account and cluste
 discovered from.
 
 Only a hard *local* misconfiguration disables a reader outright (rather than retrying): AWS
-config that will not load, or two readers resolving to the same account identity. If every
+config that will not load. Two readers resolving to the same account identity are logged at
+Warn and both kept running. If every
 reader hits such an error the daemon still runs — discovering nothing — instead of
 crash-looping.
 
@@ -532,11 +538,191 @@ The proxy task role (`tsserve-proxy`) carries both the Tailscale workload identi
 
 ---
 
+## Lambda Function Backends
+
+When `TSSERVE_DISCOVERY` includes `lambda`, tsserve discovers AWS Lambda functions by their resource tags and serves each as a **function backend**. A function backend is not dialled: each request to it is translated into an event, delivered with one synchronous `Invoke` call to the Lambda API, and the function's return value is translated back into the response. Otherwise it is a backend like any other — it joins its service's backend pool, is served round-robin, and withdraws the service when it is the last member to leave.
+
+### When to use this mode
+
+- The workload is a small request/response HTTP function: a handful of routes, small JSON or form bodies, small responses, no streaming or WebSockets.
+- The function should be reachable on the tailnet, with the caller's Tailscale identity, without a function URL, API Gateway, or load balancer in front of it.
+- tsserve already runs on an AWS proxy host (typically for [ECS Cluster Mode](#ecs-cluster-mode)); `TSSERVE_DISCOVERY=ecs,lambda` serves ECS-backed and function-backed services from the one process.
+
+### Deployment topology
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Border VPC                                                   │
+│   ┌──────────────────────────────────────────────────────┐   │
+│   │ Proxy host (EC2)                                     │   │
+│   │   tsserve                                            │   │
+│   │     tsnet.Server ───────────────▶ Tailscale (HTTPS)  │   │
+│   │     Lambda reader ──▶ Tagging API, STS               │   │
+│   │     Manager + ReverseProxy                           │   │
+│   │       └─ invoker ──▶ Lambda API (Invoke)             │   │
+│   └──────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────┘
+                              │ regional AWS APIs
+                              ▼
+              Lambda function (any VPC config, or none;
+              no function URL, no public endpoint)
+```
+
+All three APIs are regional AWS endpoints. The proxy host reaches them through the border VPC's internet egress, or privately through the `com.amazonaws.<region>.lambda`, `com.amazonaws.<region>.tagging` and `com.amazonaws.<region>.sts` interface VPC endpoints. The function needs no VPC attachment, no network path to or from the proxy host, and no public endpoint: the Lambda service delivers the invocation. Only STS is optional — see the IAM table below.
+
+### Function tags
+
+Functions are configured with AWS resource tags on the function, using the same `tsserve.*` keys as container labels:
+
+| Tag | Required | Description |
+|---|---|---|
+| `tsserve.enable` | yes | Must be `true`. The reader asks the Tagging API only for functions carrying this tag and value. |
+| `tsserve.service` | yes | The Tailscale service name; must start with `svc:`. As for containers, it must match a service defined in the Tailscale admin console. |
+| `tsserve.caps` | no | Comma-separated app capability names, as for containers. See [App Capabilities](#app-capabilities). |
+| `tsserve.qualifier` | no | A published version number, alias name, or `$LATEST` to invoke. Unset ⇒ the unqualified function (`$LATEST`) is invoked. |
+| `tsserve.port`, `tsserve.network`, `tsserve.scheme` | — | Ignored on a function. A function has no port or network, and its scheme is always the internal `lambda`, which cannot be set by a tag or a container label. |
+
+Lambda tags belong to the function, not to its versions or aliases, so one tag set covers every qualifier. A function whose tags fail validation — a missing or malformed `tsserve.service`, a malformed `tsserve.qualifier` — is logged at Warn once (quiet while the same failure persists), skipped, and re-examined on every poll. If it was already serving under an earlier, valid tag set, it stays registered until its tags are fixed or it disappears.
+
+Tags can change on a live function. A change to a function's service, caps or qualifier is applied on the next poll as the backend moving: the old registration is withdrawn and the new one made. If the function was its service's only backend, the service is withdrawn and re-advertised (re-provisioning its certificate); if it shares a pool, new caps that differ from the pool's are refused by the [conflict rule](#2-service-manager) and retried each poll.
+
+A function backend's registration key is its unqualified function ARN, and its **target** — shown in logs and on the status page — is `lambda://<function ARN>`, with `:<qualifier>` appended when one is set.
+
+### Lifecycle (polling model)
+
+Each Lambda reader polls one region with one credential context:
+
+1. Every `TSSERVE_LAMBDA_POLL_INTERVAL` (default `30s`), call the Resource Groups Tagging API `GetResources` with resource type `lambda:function` and the tag filter `tsserve.enable=true`, following pagination to the last page. Tag values come from the same response; no Lambda API calls are made to discover functions.
+2. Register every tagged function not yet registered, or whose tags changed.
+3. Deregister every previously registered function missing from this poll — deleted, untagged, or `tsserve.enable` no longer `true`.
+
+An initial poll runs at start. A reader whose poll fails is unhealthy and polls at the slower `TSSERVE_LAMBDA_RETRY_INTERVAL` (default `2m`) until it succeeds; a function whose registration failed or was refused is retried on every poll while it is still tagged. There is no event-driven path, so a tag change takes effect within one poll interval.
+
+### API quota notes
+
+`GetResources` returns up to 100 functions per call, so a reader makes one call per 100 tagged functions per poll. The Tagging API's `GetResources` rate limit is 15 calls/second per account and region, shared with every other caller in that account and region; at the 30s default even hundreds of tagged functions cost a fraction of a call per second. Discovery clients use the SDK's adaptive retry mode, as the ECS readers do, and a failed poll is reconciled by the next one.
+
+`Invoke` is subject to the function's own concurrency and the account's Lambda quotas. Those are the function owner's concern; tsserve does not manage them, and reports a throttled `Invoke` as the `throttled` backend-error reason.
+
+### Multiple accounts and regions
+
+A Lambda reader discovers the functions of one account in one region. With `TSSERVE_LAMBDA_ACCOUNTS` unset, tsserve runs a single reader built from `AWS_REGION`, `TSSERVE_LAMBDA_AWS_PROFILE` and `TSSERVE_LAMBDA_AWS_CONFIG_FILE`, named `default`. To discover functions in several accounts, or in several regions of one account, set `TSSERVE_LAMBDA_ACCOUNTS` to a JSON array: tsserve builds one independent reader per entry.
+
+Each entry accepts the fields of a [`TSSERVE_ECS_ACCOUNTS`](#multiple-aws-accounts) entry except `cluster`; a blank field inherits the shared default:
+
+| Field | Inherits from | Purpose |
+|---|---|---|
+| `name` | AWS account ID (resolved via `sts:GetCallerIdentity`) | Identity label in logs, on the status page, and in each function backend's origin. Must be unique across entries. |
+| `region` | `AWS_REGION` | Region this reader discovers and invokes functions in. |
+| `profile` | `TSSERVE_LAMBDA_AWS_PROFILE` | AWS shared-config profile. |
+| `configFile` | `TSSERVE_LAMBDA_AWS_CONFIG_FILE` | AWS shared-config file path. |
+| `accessKeyID` + `secretAccessKey` | — | Static credentials (set both or neither). |
+
+```jsonc
+// TSSERVE_LAMBDA_ACCOUNTS (single line in the systemd EnvironmentFile)
+[
+  {"profile": "fn-reader-111"},
+  {"name": "222-use1", "profile": "fn-reader-222", "region": "us-east-1"},
+  {"name": "222-apse2", "profile": "fn-reader-222", "region": "ap-southeast-2"}
+]
+```
+
+Because a reader is per region, the usual multi-region layout is several entries for one account with different `region`s. Their STS identities are equal, so **such entries need explicit, distinct `name`s**, as in the second and third entries above. Two readers resolving to the same identity are logged at Warn and both kept running.
+
+A reader's profile is used for all three of its clients: discovery (Tagging, STS) and invocation (Lambda). A function is therefore invoked by the principal of the reader that discovered it — in a cross-account setup, the role that reader's profile assumes in the function's account. As for ECS, these profiles are scoped to the Lambda readers only; tsnet's WIF auth flow keeps using the host's default identity.
+
+Lambda readers have the [reader resilience](#reader-resilience) of ECS readers: an unassumable role leaves that reader unhealthy and retrying at `TSSERVE_LAMBDA_RETRY_INTERVAL` while every other reader serves; only an AWS config that will not load disables a reader outright; and if every reader is disabled the daemon still runs, discovering nothing. Lambda readers appear in the status page's **Readers** table beside ECS readers, with mode `lambda`.
+
+### IAM permissions
+
+The principal each reader runs as — the host's IAM role, or the role its profile assumes — must permit:
+
+| Action | Resource | Purpose |
+|---|---|---|
+| `tag:GetResources` | `*` (the action cannot be scoped to a resource) | Discover tagged functions and read their tags. |
+| `lambda:InvokeFunction` | The functions to be served | Invoke them. Scope it with a `StringEquals` condition on `aws:ResourceTag/tsserve.enable` = `true`, or list the function ARNs. When functions use `tsserve.qualifier`, grant the qualified ARNs too (`arn:aws:lambda:<region>:<account>:function:<name>:*`): permission on the unqualified ARN does not cover a version or alias. |
+| `sts:GetCallerIdentity` | `*` | Resolve the account ID used as the reader's name. Called only for a `TSSERVE_LAMBDA_ACCOUNTS` entry that omits `name`. AWS allows this call without an IAM grant; it needs only a reachable STS endpoint. |
+
+tsserve never creates or modifies functions, aliases, tags, resource policies or IAM.
+
+> **Warning — the forwarded identity headers are only as trustworthy as the function's invocation path.** Client-supplied copies of these headers never reach the backend — Tailscale's serve layer manages `Tailscale-User-*` and `Tailscale-App-Capabilities`, and tsserve strips inbound `Tailscale-Node-*` — so a function invoked by tsserve can rely on them. Anyone else who can invoke the function can put whatever headers they like in the event. A function that makes authorisation decisions from these headers must be invokable **only by tsserve's principal**: no function URL, no API Gateway or load-balancer integration, no resource-policy grant to another principal, and no other role holding `lambda:InvokeFunction` on it.
+
+### Requests and responses
+
+Each attempt against a function backend is one `Invoke` with `InvocationType=RequestResponse`, the function ARN, and the qualifier if one is set. The proxy's usual request handling — `X-Forwarded-*`, the identity headers, the [node identity headers](#node-identity-headers), metrics — runs first, so the function sees the headers a container backend would.
+
+**Event.** The payload is the payload-format-2.0 event a Lambda function URL delivers:
+
+| Field | Value |
+|---|---|
+| `version`, `routeKey` | `"2.0"`, `"$default"` |
+| `rawPath`, `requestContext.http.path` | The request path as sent, percent-encoding preserved. |
+| `rawQueryString`, `queryStringParameters` | The query string, and its decoded parameters with several values of one name joined by `,`. |
+| `headers` | Every forwarded request header with a non-empty value, name lowercased, several values joined by `,`. `host` is the service FQDN the client addressed. `Cookie` is not repeated here. |
+| `cookies` | The `Cookie` header split into one entry per `;`-separated pair. |
+| `requestContext.domainName` | The service FQDN. |
+| `requestContext.stage` | `"$default"` |
+| `requestContext.http` | `method`, `path`, `protocol`, `sourceIp` (the caller's tailnet IP), `userAgent`. |
+| `body`, `isBase64Encoded` | The request body, as text when the `Content-Type` is `text/*`, `application/json`, `application/x-www-form-urlencoded`, `application/xml` or a `+json`/`+xml` type, and base64-encoded with `isBase64Encoded: true` otherwise. Empty with no body. |
+
+Other function-URL fields (`requestContext.accountId`, `requestId`, `time`, and so on) are left out.
+
+**Response.** tsserve applies the function-URL inference rule and nothing more:
+
+- If the function returns a JSON object containing `statusCode`, that is the response status; each entry of `headers` becomes a response header; each entry of `cookies` becomes a `Set-Cookie` header; and the body is `body`, base64-decoded when `isBase64Encoded` is `true`. `Content-Length` is set from the body; a `content-length` or `transfer-encoding` entry in `headers` is dropped.
+- Any other return value — a string, number, array, `null`, or an object without `statusCode` — is a `200` with `Content-Type: application/json` and the returned JSON as the body.
+- A structured result that cannot be used — a `statusCode` outside 100–999, or a `body` that is not valid base64 when `isBase64Encoded` is `true` — is a 502. tsserve does not default the `Content-Type` of a structured result; a function should set it.
+
+### Limits containers do not have
+
+- **Buffered bodies.** The request body is read in full before `Invoke`, and the response is complete before any of it reaches the client. A request body over 4 MiB is answered with `413 Payload Too Large` without invoking the function — one limit whatever the encoding, so that a base64-encoded body still fits Lambda's 6 MB synchronous payload maximum. A text body is JSON-escaped in the event, so one under the cap but dense with quotes, backslashes or control characters can still exceed Lambda's limit; `Invoke` then fails and the client gets a 502. Text bodies are expected to be UTF-8. A response over Lambda's own 6 MB limit fails in Lambda and reaches the client as a 502.
+- **No WebSockets or streaming.** Protocol upgrades, server-sent events and response streaming are not supported. A function that returns `101` produces a 502.
+- **Timeouts.** tsserve adds no response timeout; the function's own configured timeout governs, and a function that times out is a function error. Connecting to the Lambda endpoint is bounded by the same 5s budget as a container dial, so a missing VPC endpoint route costs one dial timeout. A client that cancels its request cancels the `Invoke` in flight.
+
+### Failures and retries
+
+| Outcome | Client sees | Backend-error `reason` | Retried against another pool member? |
+|---|---|---|---|
+| The function ran and failed (threw, timed out, or returned a response too large to deliver) | 502 | `function-error` | No — the function ran. The log line names the target and the function's `errorType` and `errorMessage`. |
+| `Invoke` throttled (`TooManyRequestsException`) | 502 if not retried, or every member failed | `throttled` | Yes, for requests without a body. |
+| Function not found (deleted since the last poll) or invoke permission denied | 502 if not retried, or every member failed | `other` | Yes, for requests without a body. A deleted function leaves the pool at the first poll that no longer lists it. |
+| The Lambda endpoint could not be reached (dial, DNS, TLS handshake) | 502 if not retried, or every member failed | the connection reasons: `timeout`, `connection-refused`, `dns`, … | Yes, for requests without a body. |
+| Any other failure — a 5xx from the Lambda API, a failure after the call was sent | 502 | `other`; `eof` or `timeout` when the connection dropped or timed out mid-call | No. |
+
+This is the proxy's [retry rule](#3-reverse-proxy) unchanged: a request is retried against another member only when the attempt certainly did not run the function, and only when it carries no body. A throttle that applies account-wide fails every member alike. The Lambda client used for `Invoke` has the AWS SDK's own retries **disabled** — one HTTP attempt per call — because the SDK would re-send on a connection error or a 5xx without knowing whether the function ran (running a `POST` twice), and would hide throttling. The readers' discovery clients keep the SDK's adaptive retries.
+
+### Homogeneous pools
+
+A backend pool holds only container backends or only function backends. The first backend registered for a service fixes its kind: a service whose first backend is a function has the scheme `lambda`, and a container offered to it — or a function offered to an `http` or `https` service — is refused by the [conflict rule](#2-service-manager) like any scheme mismatch, logged at Warn and retried by its watcher. To move a service from containers to a function (or back), retag: once the last old backend leaves, the service is withdrawn and re-advertised by the first new one.
+
+### Example
+
+A function in account `111111111111`, served as `svc:tokens` from a proxy host running both ECS and Lambda discovery:
+
+```
+# Function tags
+tsserve.enable    = true
+tsserve.service   = svc:tokens
+tsserve.qualifier = live
+```
+
+```
+# /etc/tsserve/tsserve.env
+TSSERVE_DISCOVERY=ecs,lambda
+AWS_REGION=us-east-1
+TSSERVE_ECS_CLUSTER=prod-apps
+TSSERVE_LAMBDA_AWS_PROFILE=fn-reader
+```
+
+Within one poll interval the status page lists `svc:tokens` with backend `lambda://arn:aws:lambda:us-east-1:111111111111:function:tokens:live`, and `https://tokens.<tailnet>.ts.net/` returns the function's response.
+
+---
+
 ## Core Components
 
-Exactly one watcher is active per tsserve process, chosen at startup by `TSSERVE_DISCOVERY`. Both watchers feed the same `Registrar` interface consumed by the Service Manager, so the manager and reverse proxy are unaware of the discovery backend.
+`TSSERVE_DISCOVERY` lists the discovery modes to run, and every listed mode's watchers run side by side in one process against one Service Manager. The Docker and ECS watchers feed the same `Registrar` interface, registering container backends by `host:port`; the Lambda watcher registers function backends through a separate entry that carries each function's invoker instead of an address. Apart from the scheme a function-backed service is advertised with and the transport its requests go through, the manager treats both kinds alike. A terminal error from any mode's watcher ends the process, as it did when only one mode could run; a mode whose readers are all disabled by configuration errors reports nothing and leaves the other modes running.
 
-### 1a. Docker Watcher (`TSSERVE_DISCOVERY=docker`)
+### 1a. Docker Watcher (`docker`)
 
 Connects to the Docker daemon via the Docker socket and monitors container lifecycle events.
 
@@ -555,7 +741,7 @@ Connects to the Docker daemon via the Docker socket and monitors container lifec
 - Docker discovery is event-driven, with a reconciliation sweep behind it: every 30 seconds the watcher re-lists containers and brings the registered set into line with what Docker reports. A container that is running and labelled but not serving — because its registration failed or was refused for a conflict — is retried on that cadence and registers once the cause clears, with no restart and no new start event. A container that has gone is deregistered, and its retry state is dropped with it.
 - Only record a container as active once `Register` reports the backend is serving, and log a failure at Warn once per distinct failure rather than once per sweep — the same rule the ECS watcher follows.
 
-### 1b. ECS Watcher (`TSSERVE_DISCOVERY=ecs`)
+### 1b. ECS Watcher (`ecs`)
 
 Queries the AWS ECS API on a fixed interval and drives the same `Registrar` interface as the Docker watcher. See [ECS Cluster Mode](#ecs-cluster-mode) for the user-facing description; this section covers implementation.
 
@@ -576,11 +762,29 @@ Queries the AWS ECS API on a fixed interval and drives the same `Registrar` inte
 - Only record a registration key as active once `Register` reports the backend is serving. A key whose registration failed or was refused is retried on every subsequent cycle while its task is still seen, and logged at Warn once per distinct failure rather than once per poll interval.
 - Handle ECS API throttling: SDK retries with exponential backoff are sufficient at expected scales (a few `Describe*` calls per poll cycle).
 
+### 1c. Lambda Watcher (`lambda`)
+
+Polls the Resource Groups Tagging API for tagged functions and registers each as a function backend. See [Lambda Function Backends](#lambda-function-backends) for the user-facing description; this section covers implementation.
+
+**Responsibilities:**
+- Build one reader per `TSSERVE_LAMBDA_ACCOUNTS` entry (or one from the shared defaults), each with its own AWS credential context and region.
+- On startup and every `TSSERVE_LAMBDA_POLL_INTERVAL`, list every function tagged `tsserve.enable=true` in the reader's region, consuming every page before acting, then register new or changed functions and deregister those no longer listed.
+- Validate each function's tags and build its invoker, bound to the reader's Lambda client and the function's qualifier.
+- Pass each function backend to the Service Manager with an origin naming the reader's account and region.
+
+**Implementation notes:**
+- Use `github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi` for discovery and `.../service/lambda` for invocation. Each reader loads its AWS config through the same loader as the ECS readers (region, profile, config file, static keys, adaptive retry), from `TSSERVE_LAMBDA_AWS_PROFILE` / `TSSERVE_LAMBDA_AWS_CONFIG_FILE` rather than the process-wide variables. The reader's Lambda client is built from the same credentials with retries disabled and the proxy's dial budget.
+- Pagination ends when `GetResources` returns an empty `PaginationToken`. Deregistering before the last page is read would tear down every function on a later page each cycle.
+- Use the unqualified function ARN as the registration key. Record what each active key was registered with — service, caps, qualifier — and treat a change in any of them as the backend moving: deregister, then register again.
+- Do not use the container-label parser: it requires `tsserve.port`, which a function never has. Service and caps are validated by the same rules; `tsserve.port`, `tsserve.network` and `tsserve.scheme` are ignored.
+- Only record a function as active once registration reports it serving; retry failures every cycle and log each distinct failure at Warn once. A function whose tags fail validation is not treated as gone, so a function already serving stays registered.
+- Readers share the ECS readers' registry and resilience rules: an unassumable role leaves the reader unhealthy and retrying, resolving its account ID lazily; an AWS config that will not load disables it.
+
 ### 2. Service Manager
 
 Owns the `tsnet.Server` instance and manages the mapping from Tailscale services to active listeners.
 
-A **backend** is one discovered endpoint (host and port) that can serve a service; the watcher-supplied **registration key** identifies it (a Docker container ID, or `taskArn#containerName` in ECS). An **advertised service** is a Tailscale Service tsserve holds an open `ListenService` listener for, and its **backend pool** is the ordered set of backends currently registered against it. Scheme and caps are properties of the advertised service, not of any one backend.
+A **backend** is one discovered endpoint that can serve a service: a **container backend**, reached at a host and port, or a **function backend**, a Lambda function reached through the Lambda API. The watcher-supplied **registration key** identifies it (a Docker container ID, `taskArn#containerName` in ECS, or the unqualified function ARN). Its **target** — `scheme://host:port`, or `lambda://<function ARN>[:<qualifier>]` — names it in logs and on the status page. An **advertised service** is a Tailscale Service tsserve holds an open `ListenService` listener for, and its **backend pool** is the ordered set of backends currently registered against it. Scheme and caps are properties of the advertised service, not of any one backend.
 
 **Responsibilities:**
 - Maintain a map of `serviceName → advertised service`, each owning its `ServiceListener`, `http.Server`, reverse proxy, cancel function and backend pool, plus an index from registration key to service name.
@@ -590,8 +794,8 @@ A **backend** is one discovered endpoint (host and port) that can serve a servic
   3. Create one `httputil.ReverseProxy` for the service, reading its backend pool per request.
   4. Serve HTTP on the returned `ServiceListener` in a goroutine. Note: despite calling `http.Serve` (not `http.ServeTLS`), TLS is handled by tsnet's listener — the `ServiceListener` already terminates TLS before handing the request to the handler.
   5. Put the backend in the pool and record the advertised service.
-- When a watcher reports a backend for a service that **is** advertised: add it to that service's pool. `ListenService` is called once per advertised service, never once per backend. Every backend carrying the label joins the pool regardless of provenance — several tasks of one ECS service, tasks of different ECS services, tasks found by different readers, and Docker containers.
-- **Conflict rule.** A backend whose `tsserve.scheme` differs from the advertised service's, or whose `tsserve.caps` differ from it as a set, is refused: it joins no pool and is recorded nowhere. Caps in particular cannot vary, because tsnet fixes them when the listener opens. The backend port is *not* compared — in ECS bridge mode each task has its own dynamic host port, which is exactly the shape a pool exists to serve. Once the pool empties, the next registration (including a previously refused one) advertises the service afresh with its own scheme and caps.
+- When a watcher reports a backend for a service that **is** advertised: add it to that service's pool. `ListenService` is called once per advertised service, never once per backend. Every backend carrying the label joins the pool regardless of provenance — several tasks of one ECS service, tasks of different ECS services, tasks found by different readers, and Docker containers; likewise several functions tagged with one service, from any Lambda reader.
+- **Conflict rule.** A backend whose scheme differs from the advertised service's, or whose `tsserve.caps` differ from it as a set, is refused: it joins no pool and is recorded nowhere. Caps in particular cannot vary, because tsnet fixes them when the listener opens. A function backend's scheme is always `lambda`, so the same comparison keeps pools homogeneous: a container is refused by a function-backed service and a function by a container-backed one. The backend port is *not* compared — in ECS bridge mode each task has its own dynamic host port, which is exactly the shape a pool exists to serve. Once the pool empties, the next registration (including a previously refused one) advertises the service afresh with its own scheme and caps.
 - When a watcher reports a backend has gone:
   1. Look up its service by registration key and remove that backend from the pool. The listener, the HTTP server and in-flight requests to other members are untouched.
   2. When the pool is now empty, close the `ServiceListener` (this stops accepting new connections) and drop the advertised service. The name is free for a fresh registration afterwards.
@@ -606,20 +810,20 @@ A **backend** is one discovered endpoint (host and port) that can serve a servic
 
 ### 3. Reverse Proxy
 
-One Go `net/http/httputil.ReverseProxy` per advertised service, shared by every backend in its pool.
+One Go `net/http/httputil.ReverseProxy` per advertised service, shared by every backend in its pool. A container-backed service's proxy sends each attempt through one shared `http.Transport`; a function-backed service's proxy hands each attempt to the chosen member's **invoker**, which performs it as one Lambda `Invoke` (see [Requests and responses](#requests-and-responses)).
 
 **Responsibilities:**
 - Forward each request to a backend chosen from the service's pool, round-robin in pool order. The rotation advances once per request. A backend added to the pool starts receiving requests on the next request; one removed receives no further requests. No proxy is built per backend or per request.
-- **Retry rule.** When an attempt fails *before the request was written to the backend* (dial refused, dial timeout, no route, DNS failure, TLS handshake failure) and the request carries no body, try the remaining pool members in rotation order, at most once each, and return the first successful response. In every other case — a failure after the request was written, or a request carrying a body — there is no retry and the client gets a 502. Retrying is done at the `RoundTrip` boundary, where nothing has yet been written to the client, so it can never replay a request a backend has already acted on. Server requests have no rewindable body, which is why a request carrying one is never retried; clients needing that reliability retry themselves.
-- Bound connection establishment to a few seconds (5s) for both `http` and `https` services, so a blackholed member costs a request one dial timeout rather than the Go default of 30s before the next member is tried.
-- Set `X-Forwarded-For`, `X-Forwarded-Proto` headers (Go's ReverseProxy does `X-Forwarded-For` by default). The outbound URL host and `Host` header name the backend that actually receives each attempt.
+- **Retry rule.** When an attempt fails *before the request was written to the backend* (dial refused, dial timeout, no route, DNS failure, TLS handshake failure — or, for a function backend, any failure that means the function did not run: see [Failures and retries](#failures-and-retries)) and the request carries no body, try the remaining pool members in rotation order, at most once each, and return the first successful response. In every other case — a failure after the request was written, or a request carrying a body — there is no retry and the client gets a 502. Retrying is done at the `RoundTrip` boundary, where nothing has yet been written to the client, so it can never replay a request a backend has already acted on. Server requests have no rewindable body, which is why a request carrying one is never retried; clients needing that reliability retry themselves.
+- Bound connection establishment to a few seconds (5s) for `http` and `https` services, and for the connection to the Lambda endpoint, so a blackholed member costs a request one dial timeout rather than the Go default of 30s before the next member is tried.
+- Set `X-Forwarded-For`, `X-Forwarded-Proto` headers (Go's ReverseProxy does `X-Forwarded-For` by default). For a container backend, the outbound URL host and `Host` header name the backend that actually receives each attempt; a function backend has no host of its own, so its event carries the service FQDN the client addressed.
 - Inject [node identity headers](#node-identity-headers) (`Tailscale-Node-Name` for every peer, `Tailscale-Node-Tags` for tagged peers), resolved via `LocalClient.WhoIs`, and strip any inbound copies of those headers first to prevent spoofing.
 - Log proxy errors, naming the backend each failed attempt targeted.
 
 **Implementation notes:**
 - Override the `ErrorHandler` to log errors and return 502. It is not the place to retry: it is also reached after a backend has returned `101 Switching Protocols`, and after the client connection has been hijacked.
 - Decide whether an attempt failed before the request was written from the error's type, not its text — string matching cannot tell a dial timeout from a read timeout on a request that was already sent.
-- If `tsserve.scheme=https`, set the proxy target scheme to `https` and configure the transport to skip TLS verification (for self-signed backend certs). The transport is shared by all pool members.
+- If `tsserve.scheme=https`, set the proxy target scheme to `https` and configure the transport to skip TLS verification (for self-signed backend certs). The transport is shared by all pool members. Function backends do not use it: their Lambda client verifies the Lambda endpoint's certificate as usual.
 - A hijacked (protocol-upgrade) connection stays bound to the backend that accepted it for its lifetime. Removing that backend from the pool does not close the connection; it ends when the backend does.
 - There are no health checks: a backend stays in the pool until discovery removes it, and per-request retry covers the window in between.
 
@@ -627,7 +831,7 @@ One Go `net/http/httputil.ReverseProxy` per advertised service, shared by every 
 
 ## Lifecycle Handling
 
-The "Container Start / Stop / Restart" subsections below describe Docker mode. The ECS mode lifecycle is poll-driven and is described in [ECS Cluster Mode → Lifecycle (polling model)](#lifecycle-polling-model). The shared parts — startup, shutdown, and how the Service Manager reacts to register/deregister calls — are documented here.
+The "Container Start / Stop / Restart" subsections below describe Docker mode. The ECS and Lambda lifecycles are poll-driven and are described in [ECS Cluster Mode → Lifecycle (polling model)](#lifecycle-polling-model) and [Lambda Function Backends → Lifecycle (polling model)](#lifecycle-polling-model-1). The shared parts — startup, shutdown, and how the Service Manager reacts to register/deregister calls — are documented here.
 
 ### Startup
 
@@ -635,8 +839,8 @@ The "Container Start / Stop / Restart" subsections below describe Docker mode. T
 2. Initialise `tsnet.Server` with all configured fields (`Hostname`, `Dir`, `AuthKey`, `ClientID`, `ClientSecret`, `IDToken`, `Audience`, `AdvertiseTags`). Call `srv.Start()`. tsnet handles authentication internally — OIDC token exchange, OAuth key generation, or auth key login.
 3. Wait for tsnet to be ready (connected to tailnet).
 4. Obtain `LocalClient` via `srv.LocalClient()` for the status-page tailnet view.
-5. Select the watcher based on `TSSERVE_DISCOVERY` (`docker` or `ecs`).
-6. Start the watcher. It performs an initial enumeration (Docker: `ContainerList` + event subscription; ECS: `ListTasks` + the first poll) and registers any qualifying backends. Both watchers then keep repeating that enumeration — the ECS poll interval, the Docker sweep interval — so a backend that failed to register the first time is not stranded.
+5. Parse `TSSERVE_DISCOVERY` into its list of modes (`docker`, `ecs`, `lambda`), rejecting an unknown, empty or repeated entry. Each mode reads and validates its own variables only when it is listed.
+6. Start every listed mode's watchers. Each performs an initial enumeration (Docker: `ContainerList` + event subscription; ECS: `ListTasks` + the first poll; Lambda: the first `GetResources` poll) and registers any qualifying backends. Every watcher then keeps repeating that enumeration — the ECS and Lambda poll intervals, the Docker sweep interval — so a backend that failed to register the first time is not stranded.
 
 ### Container Start
 
@@ -673,7 +877,7 @@ When a container restarts, Docker emits `die` then `start`. The stop handler rem
 
 | Scenario | Behaviour |
 |---|---|
-| `ListenService` fails (e.g. service not defined, node untagged, serve-config `etag mismatch`) | `Register` returns an error; the backend is not recorded as active. Do not crash. Both watchers log it at Warn on the first failure (quiet while the same failure persists) and retry the container or task on their next cycle — the ECS poll interval, or the Docker sweep interval — so a failure is recovered from without a restart. |
+| `ListenService` fails (e.g. service not defined, node untagged, serve-config `etag mismatch`) | `Register` returns an error; the backend is not recorded as active. Do not crash. Every watcher logs it at Warn on the first failure (quiet while the same failure persists) and retries the container, task or function on its next cycle — the ECS or Lambda poll interval, or the Docker sweep interval — so a failure is recovered from without a restart. |
 | `ListenService` fails because HTTPS/MagicDNS not enabled | Fatal error on first occurrence. Exit with a clear message telling the user to enable HTTPS and MagicDNS in the admin console. |
 | Container IP cannot be resolved | Log warning (Debug while the same failure repeats, so a sweep does not warn on every cycle). Skip this container. Retry on the next Docker event for this container, or on the next sweep. |
 | Backend unreachable (container crashed but event not yet received) | The reverse proxy tries the remaining pool members when the request carries no body, and returns the first successful response. When every member fails, or the request carries a body, the client gets a 502. Normal behaviour. |
@@ -685,9 +889,16 @@ When a container restarts, Docker emits `die` then `start`. The stop handler rem
 | awsvpc-mode task with no `ElasticNetworkInterface` attachment yet | Log debug message. Skip this poll. The next cycle will pick it up once the ENI is attached. |
 | `ec2:DescribeInstances` fails for a container instance (ECS mode) | Log warning. Skip this container. Cached host IPs are invalidated on failure so the next poll retries cleanly. |
 | `tsnet.Server.Start()` fails (e.g. bad auth key, OIDC token exchange failure, expired credentials) | Fatal error. Exit with message. For OIDC failures, suggest checking the federated identity configuration in the Tailscale admin console. |
-| Same `tsserve.service` on two containers (Docker mode) or two tasks (ECS mode) | Both join the service's backend pool and both receive traffic. The service stays advertised while either remains. |
-| A backend's `tsserve.scheme` or `tsserve.caps` disagree with the advertised service | The backend is refused and not added to the pool; existing members keep serving. Logged at Warn by the watcher. Retried per the `ListenService` row above. |
+| Same `tsserve.service` on two containers (Docker mode), two tasks (ECS mode) or two functions (Lambda mode) | Both join the service's backend pool and both receive traffic. The service stays advertised while either remains. |
+| A backend's scheme or `tsserve.caps` disagree with the advertised service — including a container offered to a function-backed service, or a function to a container-backed one | The backend is refused and not added to the pool; existing members keep serving. Logged at Warn by the watcher. Retried per the `ListenService` row above. |
 | Last pool member leaves before its replacement is discovered | The service is torn down and re-advertised when the replacement appears, re-provisioning its certificate. Within one ECS poll cycle the watcher registers new tasks before deregistering missing ones, so a replacement that is already RUNNING joins the pool before the old member leaves. |
+| Function error: the function threw, timed out, or returned a response over Lambda's limit | 502. Logged with the target and the function's `errorType` and `errorMessage`; counted as `function-error`. Not retried against another member — the function ran. |
+| `Invoke` throttled (`TooManyRequestsException`) | Counted as `throttled`. A request without a body is retried against the remaining pool members; otherwise, or when every member is throttled, 502. The SDK does not retry `Invoke` itself. |
+| Request body over a function backend's 4 MiB cap | `413 Payload Too Large` from tsserve; the function is not invoked and no backend error is counted. |
+| Function deleted between polls, or `lambda:InvokeFunction` denied | The function did not run: a request without a body is retried against the remaining pool members; otherwise, or when none succeeds, 502. A deleted function is deregistered at the first poll that no longer lists it. |
+| Tagging API `GetResources` fails (Lambda mode) | The reader is marked unhealthy on the status page with the error, and retries at `TSSERVE_LAMBDA_RETRY_INTERVAL`. Functions it already registered stay registered until a poll succeeds without them. Do not crash. |
+| Function tags fail validation (missing or malformed `tsserve.service`, malformed `tsserve.qualifier`) | Logged at Warn naming the function ARN, once while the failure persists. Skipped and re-examined each poll; a function already serving under earlier valid tags stays registered. |
+| A discovery mode fails terminally (e.g. the Docker event stream fails) while other modes are running | The process exits with that error, as it does when a single mode fails, withdrawing every service — including those the other modes discovered. |
 
 ---
 
@@ -801,7 +1012,7 @@ Available at `https://<TSSERVE_HOSTNAME>.<tailnet>.ts.net/`. Uses `tsnet.Server.
 
 | Path | Purpose |
 |---|---|
-| `/` | Single-page HTML status: tailnet identity (hostname, FQDN, tailnet name, MagicDNS suffix, node IPs, backend state), discovery mode, uptime, build info, and a table of currently registered services (service name → backend → caps → account → cluster → container → registered time). In ECS mode it additionally renders a **Readers** table — one row per configured reader (name → account ID → cluster → region → poll interval → last polled → state), with unhealthy readers highlighted and their last error shown, so an unassumable role is visible at a glance. No JavaScript, no external assets. |
+| `/` | Single-page HTML status: tailnet identity (hostname, FQDN, tailnet name, MagicDNS suffix, node IPs, backend state), discovery modes, uptime, build info, and a table of currently registered services (service name → backend → caps → account → cluster → key → registered time). The backend is the backend's target, so a function backend shows its `lambda://` target, `—` for cluster, and the function name as its key. When any ECS or Lambda reader is configured it additionally renders a **Readers** table — one row per configured reader (name → mode → account ID → cluster → region → poll interval → last polled → state), with unhealthy readers highlighted and their last error shown, so an unassumable role is visible at a glance. A Lambda reader's cluster is `—`. No JavaScript, no external assets. |
 | `/traefik`, `/traefik/...` | Reverse proxy to `http://localhost:<TSSERVE_TRAEFIK_PORT>` with the `/traefik` prefix stripped before forwarding. Intended for reaching a Traefik dashboard on the same host. Returns 404 with a one-line hint when `TSSERVE_TRAEFIK_PORT` is not set. |
 | `/metrics` | 404 with a hint pointing at the loopback metrics listener. |
 
@@ -828,7 +1039,7 @@ All counters and gauges are prefixed `tsserve_`. Histograms use the default Prom
 | `tsserve_proxy_response_bytes_total` | Counter | `service` | Bytes written to response bodies (does not include response headers). After a hijack, also counts bytes written to the client over the upgraded connection. |
 | `tsserve_proxy_in_flight_requests` | Gauge | `service` | Currently executing handlers, by service. Includes open WebSocket connections (they block in the handler for their lifetime). |
 | `tsserve_proxy_open_websockets` | Gauge | `service` | Current open WebSocket (hijacked protocol-upgrade) connections, by service. |
-| `tsserve_proxy_backend_errors_total` | Counter | `service`, `reason` | One increment per failed attempt against a backend, so a request retried against a second member contributes more than one. `reason` is a coarse classification: `timeout`, `connection-refused`, `dns`, `eof`, `no-backend`, `other`. |
+| `tsserve_proxy_backend_errors_total` | Counter | `service`, `reason` | One increment per failed attempt against a backend, so a request retried against a second member contributes more than one. `reason` is a coarse classification: `timeout`, `connection-refused`, `dns`, `eof`, `no-backend`, `function-error` (a function backend's function ran and failed), `throttled` (a function backend's `Invoke` was throttled), `other`. A request answered with a 413 because its body exceeds a function backend's cap is not a backend error. |
 | `tsserve_services_active` | Gauge | — | Number of Tailscale Services currently advertised. Backends joining or leaving an advertised service do not change it. |
 | `tsserve_service_backends` | Gauge | `service` | Number of backends currently in an advertised service's pool. The series is removed when the service is torn down. |
 | `tsserve_build_info` | Gauge | `version`, `revision`, `go_version` (const) | Constant `1`. Useful for grouping in dashboards. |
@@ -841,17 +1052,22 @@ Standard `go_*` and `process_*` collectors are also registered.
 
 ```
 tsserve/
-├── main.go              # Entry point, signal handling, watcher selection, wiring
+├── main.go              # Entry point, signal handling, discovery-mode startup, wiring
 ├── docker/
-│   ├── watcher.go       # Docker event subscription and container inspection
-│   └── labels.go        # Label parsing and validation (shared with ecs/)
+│   └── watcher.go       # Docker event subscription and container inspection
+├── labels/
+│   └── labels.go        # Label parsing and validation (shared by docker/, ecs/ and lambda/)
 ├── ecs/
 │   ├── watcher.go       # ECS poll-and-diff loop; drives the same Registrar
 │   ├── resolve.go       # Backend resolution: bridge (host:hostPort) vs awsvpc (eni:containerPort)
 │   └── cache.go         # Task-definition and container-instance → host-IP caches
+├── lambda/
+│   ├── watcher.go       # Lambda reader: Tagging API poll-and-diff loop, function-tag validation
+│   └── account.go       # TSSERVE_LAMBDA_ACCOUNTS parsing and reader planning
 ├── proxy/
 │   ├── manager.go       # Service Manager: tsnet.Server + active service map
-│   └── reverseproxy.go  # Reverse proxy factory with error handling
+│   ├── reverseproxy.go  # Reverse proxy factory with error handling
+│   └── invoker.go       # Function backend invoker: HTTP request ↔ Lambda Invoke translation
 ├── metrics/
 │   └── metrics.go       # Prometheus collectors + per-request middleware
 ├── local/
@@ -865,7 +1081,7 @@ tsserve/
 └── README.md
 ```
 
-The `Registrar` interface declared in `docker/watcher.go` is the seam between discovery and proxying. The ECS watcher implements no new contract; it satisfies the same interface. Label parsing is shared — `docker/labels.go` operates on `map[string]string`, which is the shape of both Docker's `Config.Labels` and ECS's `containerDefinitions[*].dockerLabels`.
+The `Registrar` interface declared in `docker/watcher.go` is the seam between discovery and proxying. The ECS watcher implements no new contract; it satisfies the same interface. The Lambda watcher registers through its own entry point, since a function backend carries an invoker rather than an address. Label parsing is shared — `labels/labels.go` operates on `map[string]string`, which is the shape of both Docker's `Config.Labels` and ECS's `containerDefinitions[*].dockerLabels`; the Lambda watcher reuses its service and caps validation for function tags.
 
 ---
 
@@ -877,9 +1093,11 @@ The `Registrar` interface declared in `docker/watcher.go` is the seam between di
 | `tailscale.com/client/tailscale` | `LocalClient` type used by the status page |
 | `github.com/docker/docker/client` | Docker daemon API client (Docker discovery mode) |
 | `github.com/docker/docker/api/types` | Docker API types for events and container inspection |
-| `github.com/aws/aws-sdk-go-v2/config` | AWS SDK config resolution (ECS discovery mode) |
+| `github.com/aws/aws-sdk-go-v2/config` | AWS SDK config resolution (ECS and Lambda discovery modes) |
 | `github.com/aws/aws-sdk-go-v2/service/ecs` | ECS API client: `ListTasks`, `DescribeTasks`, `DescribeTaskDefinition`, `DescribeContainerInstances` |
 | `github.com/aws/aws-sdk-go-v2/service/ec2` | EC2 API client: `DescribeInstances` for bridge-mode host IP resolution |
+| `github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi` | Tagging API client: `GetResources` for Lambda function discovery |
+| `github.com/aws/aws-sdk-go-v2/service/lambda` | Lambda API client: `Invoke` for function backends |
 | `github.com/prometheus/client_golang` | Prometheus collectors and `promhttp` exposition handler |
 | Go stdlib `net/http/httputil` | Reverse proxy |
 | Go stdlib `html/template` | Status page rendering |
@@ -887,7 +1105,7 @@ The `Registrar` interface declared in `docker/watcher.go` is the seam between di
 
 Notes:
 - `tailscale.com/client/tailscale` is pulled in transitively by `tailscale.com/tsnet` — it's not an additional module dependency, just an additional import path within the same module.
-- The AWS SDK is only imported by the `ecs/` package. Builds intended for Docker-only deployments can use a build tag to exclude it if image size matters; the default build includes both watchers.
+- The AWS SDK is imported by the `ecs/`, `lambda/` and `certsync/` packages, by the function backend invoker in `proxy/`, and by the startup wiring. Every build includes every watcher.
 
 ---
 
@@ -967,7 +1185,7 @@ If using app capabilities, add capability grants to the policy. For example, to 
 }
 ```
 
-The capability names in the ACL grants must match those listed in the container's `tsserve.caps` label.
+The capability names in the ACL grants must match those listed in the backend's `tsserve.caps` label or function tag.
 
 ### 2. Create services in the admin console
 
@@ -992,6 +1210,9 @@ These are explicitly not part of the initial implementation but noted for future
 - **Multiple services per container** — indexed labels like `tsserve.1.service`, `tsserve.1.port`.
 - **Path-scoped app capabilities** — allow per-path capability mounts (e.g. `tsserve.caps./foo=example.com/cap/foo`) instead of the current all-at-root approach.
 - **EventBridge-driven ECS updates** — subscribe to `ECS Task State Change` events via EventBridge → SQS for sub-second lifecycle reaction in cluster mode, instead of the v1 polling loop. Polling remains as a reconciliation fallback.
+- **Function URLs and API Gateway** — invoking a function through an IAM-gated function URL, or fronting it with API Gateway or a load balancer, instead of the Lambda `Invoke` API.
+- **Response streaming for function backends** — `InvokeWithResponseStream`, server-sent events, and bodies beyond the buffered limits.
+- **Mixed pools** — a service backed by both containers and functions at once, for a gradual cutover between them.
 - **Fargate launch-type support** — the ECS watcher's awsvpc code path already handles Fargate's task-IP shape, but Fargate has additional constraints (no container-instance ARN, no host-IP fallback, IAM via task role only) that need explicit testing and a documented setup path.
 
 ---
