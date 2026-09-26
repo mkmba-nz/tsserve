@@ -59,10 +59,53 @@ func TestShortID(t *testing.T) {
 		{"arn:aws:ecs:us-east-1:123456789012:task/MyCluster/abcdef123456789", "abcdef123456"},
 		// Composite ARN#container key (per SPEC.md for multi-container task defs)
 		{"arn:aws:ecs:us-east-1:123:task/cluster/abc123#whoami", "abc123#whoam"},
+		// A function ARN has no '/', so shortID alone would render every
+		// function as its constant prefix; rowsFor uses functionName instead.
+		{"arn:aws:lambda:us-east-1:123456789012:function:example-fn", "arn:aws:lamb"},
 	} {
 		if got := shortID(tc.in); got != tc.want {
 			t.Errorf("shortID(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestFunctionName(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"arn:aws:lambda:us-east-1:123456789012:function:example-fn", "example-fn"},
+		{"arn:aws:lambda:us-east-1:123456789012:function:a-function-name-well-over-twelve", "a-function-name-well-over-twelve"},
+	} {
+		if got := functionName(tc.in); got != tc.want {
+			t.Errorf("functionName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// A function backend's key cell shows the function name, its Backend cell the
+// lambda:// target, and its Cluster is empty (rendered as a dash).
+func TestRowsFor_FunctionBackend(t *testing.T) {
+	const arn = "arn:aws:lambda:ap-southeast-2:333333333333:function:example-fn"
+	rows := rowsFor([]proxy.ServiceView{{
+		Service: "svc:fn",
+		Scheme:  proxy.SchemeLambda,
+		Backends: []proxy.BackendView{{
+			Backend:      "lambda://" + arn + ":live",
+			Key:          arn,
+			RegisteredAt: time.Now(),
+			Origin:       proxy.Origin{Account: "333333333333", Region: "ap-southeast-2"},
+		}},
+	}})
+	if len(rows) != 1 || len(rows[0].Backends) != 1 {
+		t.Fatalf("rows = %+v, want 1 service with 1 backend", rows)
+	}
+	b := rows[0].Backends[0]
+	if b.KeyShort != "example-fn" {
+		t.Errorf("KeyShort = %q, want %q", b.KeyShort, "example-fn")
+	}
+	if b.Backend != "lambda://"+arn+":live" {
+		t.Errorf("Backend = %q", b.Backend)
+	}
+	if b.Account != "333333333333" || b.Cluster != "" {
+		t.Errorf("origin = account %q cluster %q, want 333333333333 and empty", b.Account, b.Cluster)
 	}
 }
 
@@ -97,8 +140,8 @@ func TestRowsFor_MapsServiceFields(t *testing.T) {
 	if b.Backend != "http://10.0.0.1:80" {
 		t.Errorf("Backend = %q", b.Backend)
 	}
-	if b.ContainerShort != "abcdef123456" {
-		t.Errorf("ContainerShort = %q", b.ContainerShort)
+	if b.KeyShort != "abcdef123456" {
+		t.Errorf("KeyShort = %q", b.KeyShort)
 	}
 	if !strings.HasSuffix(b.RegisteredAgo, " ago") {
 		t.Errorf("RegisteredAgo = %q, want suffix ' ago'", b.RegisteredAgo)
@@ -178,8 +221,10 @@ func TestStatusHandler_RendersReadersTable(t *testing.T) {
 	s := newTestServer(&fakeSnapshotter{})
 	s.DiscoveryMode = "ecs"
 	s.Readers = &fakeReaderSource{readers: []ReaderStatus{
-		{Name: "border", Account: "077542728448", Cluster: "border-ecs", Region: "ap-southeast-2",
+		{Mode: "ecs", Name: "border", Account: "077542728448", Cluster: "border-ecs", Region: "ap-southeast-2",
 			PollInterval: 10 * time.Second, LastError: "AccessDenied: not authorized to perform: sts:AssumeRole"},
+		{Mode: "lambda", Name: "functions", Account: "333333333333", Region: "us-west-2",
+			PollInterval: 30 * time.Second, Healthy: true, LastPollOK: time.Now()},
 	}}
 
 	rr := httptest.NewRecorder()
@@ -187,11 +232,20 @@ func TestStatusHandler_RendersReadersTable(t *testing.T) {
 	body := rr.Body.String()
 
 	for _, want := range []string{
-		"Readers (1)",
-		"077542728448",
+		"Readers (2)",
+		"<th>Mode</th>",
+		`<td class="mono">border</td>
+        <td class="mono">ecs</td>`,
 		"border-ecs",
+		"077542728448",
 		"ap-southeast-2",
 		"AccessDenied",
+		// The Lambda reader: its mode, account, region, and a dash for cluster.
+		`<td class="mono">functions</td>
+        <td class="mono">lambda</td>
+        <td class="mono">333333333333</td>
+        <td class="mono"><span class="empty">—</span></td>
+        <td class="mono">us-west-2</td>`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
@@ -283,6 +337,16 @@ func TestStatusHandler_RendersServicesTable(t *testing.T) {
 				},
 			},
 		},
+		{
+			Service: "svc:fn",
+			Scheme:  proxy.SchemeLambda,
+			Backends: []proxy.BackendView{{
+				Backend:      "lambda://arn:aws:lambda:us-west-2:333333333333:function:example-fn",
+				Key:          "arn:aws:lambda:us-west-2:333333333333:function:example-fn",
+				RegisteredAt: now.Add(-10 * time.Second),
+				Origin:       proxy.Origin{Account: "333333333333", Region: "us-west-2"},
+			}},
+		},
 	}}
 	s := newTestServer(snap)
 
@@ -303,7 +367,14 @@ func TestStatusHandler_RendersServicesTable(t *testing.T) {
 		"feedface1111",
 		"111111111111",
 		"222222222222",
-		"Services (2)", // the heading counts advertised services, not backends
+		"Services (3)", // the heading counts advertised services, not backends
+		"<th>Key</th>",
+		// The function backend: lambda:// target, account, a dash for cluster,
+		// and the function name in the key cell.
+		`<td class="mono">lambda://arn:aws:lambda:us-west-2:333333333333:function:example-fn</td>`,
+		`<td class="mono">333333333333</td>
+        <td class="mono"><span class="empty">—</span></td>
+        <td class="mono">example-fn</td>`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
@@ -317,8 +388,8 @@ func TestStatusHandler_RendersServicesTable(t *testing.T) {
 	if n := strings.Count(body, `rowspan="2"`); n != 2 {
 		t.Errorf("rowspan=\"2\" appears %d times, want 2 (Service and Caps span the pool)\n--- body ---\n%s", n, body)
 	}
-	if n := strings.Count(body, `rowspan="1"`); n != 2 {
-		t.Errorf("rowspan=\"1\" appears %d times, want 2 for the single-backend service", n)
+	if n := strings.Count(body, `rowspan="1"`); n != 4 {
+		t.Errorf("rowspan=\"1\" appears %d times, want 4 for the two single-backend services", n)
 	}
 }
 

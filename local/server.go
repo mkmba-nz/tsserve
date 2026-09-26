@@ -32,10 +32,11 @@ type Snapshotter interface {
 	Snapshot() []proxy.ServiceView
 }
 
-// ReaderStatus is the status-page view of one configured ECS reader. It mirrors
-// ecs.ReaderStatus so this package stays independent of the ecs package (main
-// adapts between the two).
+// ReaderStatus is the status-page view of one configured ECS or Lambda reader.
+// It mirrors ecs.ReaderStatus so this package stays independent of the ecs
+// package (main adapts between the two).
 type ReaderStatus struct {
+	Mode          string
 	Name          string
 	Account       string
 	Cluster       string
@@ -48,7 +49,7 @@ type ReaderStatus struct {
 	Healthy       bool
 }
 
-// ReaderSnapshotter is the read-only surface exposing configured ECS readers to
+// ReaderSnapshotter is the read-only surface exposing configured readers to
 // the status page. It is nil in Docker mode, where no readers table is shown.
 type ReaderSnapshotter interface {
 	Readers() []ReaderStatus

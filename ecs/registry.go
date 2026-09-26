@@ -9,6 +9,8 @@ import (
 // (an account/cluster credential context that a Watcher polls). It is what the
 // status page renders in the "readers" table.
 type ReaderStatus struct {
+	// Mode is the discovery mode the reader serves: "ecs" or "lambda".
+	Mode string
 	// Name is the reader's display identity: an explicit account name, the AWS
 	// account ID resolved via STS, or a positional fallback when neither is
 	// available.

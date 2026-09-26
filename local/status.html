@@ -62,14 +62,15 @@
   <h2>Readers ({{len .Readers}})</h2>
   <table>
     <thead>
-      <tr><th>Reader</th><th>Account</th><th>Cluster</th><th>Region</th><th>Poll</th><th>Last polled</th><th>State</th></tr>
+      <tr><th>Reader</th><th>Mode</th><th>Account</th><th>Cluster</th><th>Region</th><th>Poll</th><th>Last polled</th><th>State</th></tr>
     </thead>
     <tbody>
       {{range .Readers}}
       <tr{{if eq .State "error"}} class="bad"{{end}}>
         <td class="mono">{{.Name}}</td>
+        <td class="mono">{{.Mode}}</td>
         <td class="mono">{{if .Account}}{{.Account}}{{else}}<span class="empty">—</span>{{end}}</td>
-        <td class="mono">{{.Cluster}}</td>
+        <td class="mono">{{if .Cluster}}{{.Cluster}}{{else}}<span class="empty">—</span>{{end}}</td>
         <td class="mono">{{if .Region}}{{.Region}}{{else}}<span class="empty">—</span>{{end}}</td>
         <td>{{.PollInterval}}</td>
         <td>{{.LastPolled}}</td>
@@ -87,7 +88,7 @@
   {{if .Services}}
   <table>
     <thead>
-      <tr><th>Service</th><th>Backend</th><th>Caps</th><th>Account</th><th>Cluster</th><th>Container</th><th>Registered</th></tr>
+      <tr><th>Service</th><th>Backend</th><th>Caps</th><th>Account</th><th>Cluster</th><th>Key</th><th>Registered</th></tr>
     </thead>
     <tbody>
       {{range $svc := .Services}}
@@ -98,7 +99,7 @@
         {{if eq $i 0}}<td rowspan="{{len $svc.Backends}}">{{if $svc.Caps}}<span class="mono">{{range $j, $c := $svc.Caps}}{{if $j}}, {{end}}{{$c}}{{end}}</span>{{else}}<span class="empty">—</span>{{end}}</td>{{end}}
         <td class="mono">{{if $b.Account}}{{$b.Account}}{{else}}<span class="empty">—</span>{{end}}</td>
         <td class="mono">{{if $b.Cluster}}{{$b.Cluster}}{{else}}<span class="empty">—</span>{{end}}</td>
-        <td class="mono">{{$b.ContainerShort}}</td>
+        <td class="mono">{{$b.KeyShort}}</td>
         <td>{{$b.RegisteredAgo}}</td>
       </tr>
       {{end}}
