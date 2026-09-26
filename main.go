@@ -269,6 +269,7 @@ func (s readerSource) Readers() []local.ReaderStatus {
 	out := make([]local.ReaderStatus, len(src))
 	for i, r := range src {
 		out[i] = local.ReaderStatus{
+			Mode:          r.Mode,
 			Name:          r.Name,
 			Account:       r.Account,
 			Cluster:       r.Cluster,
@@ -554,6 +555,7 @@ func buildLambdaWatchers(
 			}
 		}
 		reader := readers.Add(ecs.ReaderStatus{
+			Mode:         "lambda",
 			Name:         display,
 			Region:       spec.Region,
 			PollInterval: cmp.Or(spec.PollInterval, lambda.DefaultPollInterval),
@@ -694,6 +696,7 @@ func buildECSWatchers(
 			}
 		}
 		reader := readers.Add(ecs.ReaderStatus{
+			Mode:         "ecs",
 			Name:         display,
 			Cluster:      spec.Cluster,
 			Region:       spec.Region,

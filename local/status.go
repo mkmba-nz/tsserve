@@ -57,17 +57,18 @@ type serviceRow struct {
 
 // backendRow is one member of an advertised service's backend pool.
 type backendRow struct {
-	Backend        string
-	ContainerShort string
-	RegisteredAgo  string
-	// Origin identifies the ECS reader (account + cluster) a backend was
-	// discovered from. Both are empty for Docker discovery.
+	Backend       string
+	KeyShort      string
+	RegisteredAgo string
+	// Origin identifies the reader (account and, for ECS, cluster) a backend
+	// was discovered from. Both are empty for Docker discovery.
 	Account string
 	Cluster string
 }
 
-// readerRow is the status-page view of one configured ECS reader.
+// readerRow is the status-page view of one configured ECS or Lambda reader.
 type readerRow struct {
+	Mode         string
 	Name         string
 	Account      string
 	Cluster      string
@@ -147,12 +148,18 @@ func rowsFor(services []proxy.ServiceView) []serviceRow {
 	for _, s := range services {
 		backends := make([]backendRow, 0, len(s.Backends))
 		for _, b := range s.Backends {
+			// A function ARN has no '/', so shortID would render every
+			// function as the constant "arn:aws:lamb" prefix.
+			key := shortID
+			if s.Scheme == proxy.SchemeLambda {
+				key = functionName
+			}
 			backends = append(backends, backendRow{
-				Backend:        b.Backend,
-				ContainerShort: shortID(b.Key),
-				RegisteredAgo:  humanDuration(now.Sub(b.RegisteredAt)) + " ago",
-				Account:        b.Origin.Account,
-				Cluster:        b.Origin.Cluster,
+				Backend:       b.Backend,
+				KeyShort:      key(b.Key),
+				RegisteredAgo: humanDuration(now.Sub(b.RegisteredAt)) + " ago",
+				Account:       b.Origin.Account,
+				Cluster:       b.Origin.Cluster,
 			})
 		}
 		out = append(out, serviceRow{
@@ -176,6 +183,7 @@ func readerRowsFor(src ReaderSnapshotter) []readerRow {
 	out := make([]readerRow, 0, len(readers))
 	for _, r := range readers {
 		row := readerRow{
+			Mode:         r.Mode,
 			Name:         r.Name,
 			Account:      r.Account,
 			Cluster:      r.Cluster,
@@ -199,6 +207,12 @@ func readerRowsFor(src ReaderSnapshotter) []readerRow {
 		out = append(out, row)
 	}
 	return out
+}
+
+// functionName returns the function name from a function backend's key (its
+// unqualified ARN, arn:aws:lambda:<region>:<account>:function:<name>).
+func functionName(arn string) string {
+	return arn[strings.LastIndexByte(arn, ':')+1:]
 }
 
 func shortID(id string) string {

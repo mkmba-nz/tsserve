@@ -51,6 +51,32 @@ func TestBuildLambdaWatchers_DisablesOnlyTheReaderWhoseConfigFails(t *testing.T)
 	if prod.PollInterval != lambda.DefaultPollInterval {
 		t.Errorf("prod poll interval = %s, want the %s default", prod.PollInterval, lambda.DefaultPollInterval)
 	}
+	// The mode reaches the status page through the readerSource adapter.
+	for i, r := range (readerSource{readers}).Readers() {
+		if r.Mode != "lambda" {
+			t.Errorf("status reader[%d] mode = %q, want lambda", i, r.Mode)
+		}
+	}
+}
+
+// An ECS reader is listed with its discovery mode, which reaches the status
+// page through the readerSource adapter. Static credentials and an explicit
+// name keep the build offline.
+func TestBuildECSWatchers_ReaderCarriesMode(t *testing.T) {
+	specs := []ecs.WatcherSpec{
+		{Name: "prod", Cluster: "prod-ecs", Region: "ap-southeast-2", AccessKeyID: "AKIAEXAMPLE", SecretAccessKey: "secret"},
+	}
+	readers := ecs.NewRegistry()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	if _, err := buildECSWatchers(context.Background(), specs, false, 0,
+		&registrarAdapter{fatal: make(chan error, 1)}, readers, logger); err != nil {
+		t.Fatalf("buildECSWatchers: %v", err)
+	}
+	got := (readerSource{readers}).Readers()
+	if len(got) != 1 || got[0].Mode != "ecs" || got[0].Cluster != "prod-ecs" {
+		t.Errorf("status readers = %+v, want one ecs reader for prod-ecs", got)
+	}
 }
 
 func TestParseDiscoveryModes_Accepts(t *testing.T) {
