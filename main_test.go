@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"mkmba.nz/tsserve/ecs"
 	"mkmba.nz/tsserve/lambda"
@@ -48,5 +50,141 @@ func TestBuildLambdaWatchers_DisablesOnlyTheReaderWhoseConfigFails(t *testing.T)
 	}
 	if prod.PollInterval != lambda.DefaultPollInterval {
 		t.Errorf("prod poll interval = %s, want the %s default", prod.PollInterval, lambda.DefaultPollInterval)
+	}
+}
+
+func TestParseDiscoveryModes_Accepts(t *testing.T) {
+	cases := map[string][]string{
+		"docker":                 {"docker"},
+		"ecs":                    {"ecs"},
+		"LAMBDA":                 {"lambda"},
+		"ecs,lambda":             {"ecs", "lambda"},
+		"ecs, lambda":            {"ecs", "lambda"},
+		" docker , Ecs ,lambda ": {"docker", "ecs", "lambda"},
+	}
+	for raw, want := range cases {
+		got, err := parseDiscoveryModes(raw)
+		if err != nil {
+			t.Errorf("parseDiscoveryModes(%q) error: %v", raw, err)
+			continue
+		}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("parseDiscoveryModes(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestParseDiscoveryModes_Rejects(t *testing.T) {
+	cases := map[string]string{
+		"kubernetes":     `unknown discovery mode "kubernetes"`,
+		"ecs,consul":     `unknown discovery mode "consul"`,
+		"ecs,,lambda":    `TSSERVE_DISCOVERY="ecs,,lambda" has an empty entry`,
+		"ecs, ,lambda":   `TSSERVE_DISCOVERY="ecs, ,lambda" has an empty entry`,
+		",ecs":           `TSSERVE_DISCOVERY=",ecs" has an empty entry`,
+		"ecs,":           `TSSERVE_DISCOVERY="ecs," has an empty entry`,
+		"   ":            `TSSERVE_DISCOVERY="   " has an empty entry`,
+		"ecs,lambda,ECS": `discovery mode "ECS" is repeated`,
+	}
+	for raw, want := range cases {
+		got, err := parseDiscoveryModes(raw)
+		if err == nil {
+			t.Errorf("parseDiscoveryModes(%q) = %q, want error", raw, got)
+			continue
+		}
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("parseDiscoveryModes(%q) error = %q, want it to contain %q", raw, err, want)
+		}
+	}
+}
+
+// fakeModes starts the given modes through startModes, handing each mode's
+// report channel back to the test so it can finish that mode at will.
+func fakeModes(t *testing.T, ctx context.Context, modes ...string) (map[string]chan<- error, <-chan error) {
+	t.Helper()
+	reports := make(map[string]chan<- error)
+	watchErr, err := startModes(ctx, modes, func(mode string, modeErr chan<- error) error {
+		reports[mode] = modeErr
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("startModes: %v", err)
+	}
+	if len(reports) != len(modes) {
+		t.Fatalf("started %d modes, want %d", len(reports), len(modes))
+	}
+	return reports, watchErr
+}
+
+func expectNothing(t *testing.T, watchErr <-chan error, why string) {
+	t.Helper()
+	select {
+	case err := <-watchErr:
+		t.Fatalf("watchErr = %v; want nothing (%s)", err, why)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func expectValue(t *testing.T, watchErr <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-watchErr:
+		return err
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchErr received nothing")
+		return nil
+	}
+}
+
+func TestStartModes_ForwardsFirstErrorAtOnce(t *testing.T) {
+	report, watchErr := fakeModes(t, context.Background(), "docker", "ecs", "lambda")
+	boom := errors.New("docker: daemon gone")
+	report["docker"] <- boom // ecs and lambda are still running
+	if err := expectValue(t, watchErr); err != boom {
+		t.Fatalf("watchErr = %v, want %v", err, boom)
+	}
+	report["ecs"] <- errors.New("second failure")
+	report["lambda"] <- nil
+	expectNothing(t, watchErr, "only the first error is forwarded")
+}
+
+func TestStartModes_SendsNilOnlyAfterAllFinish(t *testing.T) {
+	report, watchErr := fakeModes(t, context.Background(), "ecs", "lambda")
+	report["ecs"] <- context.Canceled
+	expectNothing(t, watchErr, "lambda is still running")
+	report["lambda"] <- nil
+	if err := expectValue(t, watchErr); err != nil {
+		t.Fatalf("watchErr = %v after every mode finished cleanly, want nil", err)
+	}
+}
+
+func TestStartModes_SilentModeWithholdsNilButNotErrors(t *testing.T) {
+	// A mode that started no readers never reports. The others finishing
+	// cleanly must not produce the nil that would end the process, but an
+	// error from another mode still gets through.
+	report, watchErr := fakeModes(t, context.Background(), "docker", "ecs", "lambda")
+	report["docker"] <- nil
+	expectNothing(t, watchErr, "ecs and lambda have not reported")
+	boom := errors.New("lambda: reader failed")
+	report["lambda"] <- boom
+	if err := expectValue(t, watchErr); err != boom {
+		t.Fatalf("watchErr = %v, want %v", err, boom)
+	}
+}
+
+func TestStartModes_StartErrorStopsStartup(t *testing.T) {
+	var started []string
+	bad := errors.New("TSSERVE_ECS_CLUSTER is required when TSSERVE_DISCOVERY includes ecs")
+	_, err := startModes(context.Background(), []string{"docker", "ecs", "lambda"}, func(mode string, _ chan<- error) error {
+		started = append(started, mode)
+		if mode == "ecs" {
+			return bad
+		}
+		return nil
+	})
+	if err != bad {
+		t.Fatalf("startModes error = %v, want %v", err, bad)
+	}
+	if strings.Join(started, ",") != "docker,ecs" {
+		t.Fatalf("started %q; modes after the failing one must not start", started)
 	}
 }
