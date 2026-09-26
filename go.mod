@@ -9,6 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.303.0
 	github.com/aws/aws-sdk-go-v2/service/ecs v1.80.0
 	github.com/aws/aws-sdk-go-v2/service/lambda v1.110.0
+	github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi v1.41.1
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.107.0
 	github.com/aws/aws-sdk-go-v2/service/sts v1.42.1
 	github.com/aws/smithy-go v1.28.1
