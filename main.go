@@ -1,9 +1,10 @@
-// Command tsserve watches Docker or AWS ECS for labelled containers and
-// exposes them as Tailscale Services using the tsnet ListenService API. See
-// SPEC.md for full details.
+// Command tsserve watches Docker or AWS ECS for labelled containers, or AWS
+// Lambda for tagged functions, and exposes them as Tailscale Services using
+// the tsnet ListenService API. See SPEC.md for full details.
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awsec2 "github.com/aws/aws-sdk-go-v2/service/ec2"
 	awsecs "github.com/aws/aws-sdk-go-v2/service/ecs"
+	awstagging "github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	awssts "github.com/aws/aws-sdk-go-v2/service/sts"
 	// Register tsnet auth-key resolvers. Without these blank imports the
@@ -39,6 +41,7 @@ import (
 	dockerpkg "mkmba.nz/tsserve/docker"
 	"mkmba.nz/tsserve/ecs"
 	"mkmba.nz/tsserve/labels"
+	"mkmba.nz/tsserve/lambda"
 	"mkmba.nz/tsserve/local"
 	"mkmba.nz/tsserve/metrics"
 	"mkmba.nz/tsserve/proxy"
@@ -141,8 +144,8 @@ func run() error {
 	mgr := proxy.NewManager(srv, lc, logger, mc)
 	defer mgr.Close()
 
-	// readers tracks per-reader ECS discovery status for the status page. It
-	// stays empty in Docker mode.
+	// readers tracks per-reader ECS and Lambda discovery status for the status
+	// page. It stays empty in Docker mode.
 	readers := ecs.NewRegistry()
 
 	discoveryMode := strings.ToLower(envDefault("TSSERVE_DISCOVERY", "docker"))
@@ -280,8 +283,12 @@ type registrarAdapter struct {
 	mgr   *proxy.Manager
 	fatal chan<- error
 	// origin tags every service this adapter registers with its discovery
-	// source. It is zero for Docker discovery and set per-reader for ECS.
+	// source. It is zero for Docker discovery and set per-reader for ECS and
+	// Lambda.
 	origin proxy.Origin
+	// invoke is the Lambda client of a Lambda reader's adapter, through which
+	// the function backends it registers are invoked.
+	invoke proxy.LambdaAPI
 }
 
 func (a *registrarAdapter) Register(containerID string, def *labels.ServiceDef, backendIP string) error {
@@ -293,13 +300,29 @@ func (a *registrarAdapter) Register(containerID string, def *labels.ServiceDef, 
 		Caps:    def.Caps,
 		Origin:  a.origin,
 	}, backendIP)
+	a.forwardFatal(err)
+	return err
+}
+
+func (a *registrarAdapter) RegisterFunction(key string, fn *lambda.Function) error {
+	err := a.mgr.RegisterFunction(key, &proxy.FunctionDef{
+		Service: fn.Service,
+		Caps:    fn.Caps,
+		Origin:  a.origin,
+		Invoker: proxy.NewFunctionInvoker(a.invoke, fn.ARN, fn.Qualifier),
+	})
+	a.forwardFatal(err)
+	return err
+}
+
+// forwardFatal hands a *proxy.FatalError to run, which exits on it.
+func (a *registrarAdapter) forwardFatal(err error) {
 	if fatalErr, ok := errors.AsType[*proxy.FatalError](err); ok {
 		select {
 		case a.fatal <- fatalErr:
 		default:
 		}
 	}
-	return err
 }
 
 func (a *registrarAdapter) Deregister(containerID string) { a.mgr.Deregister(containerID) }
@@ -320,11 +343,11 @@ func startWatcher(ctx context.Context, mode string, registrar *registrarAdapter,
 		return nil
 
 	case "ecs":
-		interval, err := parsePollInterval(os.Getenv("TSSERVE_ECS_POLL_INTERVAL"))
+		interval, err := parseInterval("TSSERVE_ECS_POLL_INTERVAL")
 		if err != nil {
 			return err
 		}
-		retryInterval, err := parseRetryInterval(os.Getenv("TSSERVE_ECS_RETRY_INTERVAL"))
+		retryInterval, err := parseInterval("TSSERVE_ECS_RETRY_INTERVAL")
 		if err != nil {
 			return err
 		}
@@ -371,30 +394,201 @@ func startWatcher(ctx context.Context, mode string, registrar *registrarAdapter,
 		}
 		logger.Info("ecs discovery configured", "readers", len(watchers), "configured", len(specs))
 
-		// Run every account's watcher concurrently. Each watcher's Run only
-		// returns on ctx cancellation, so a fan-in coordinator forwards the
-		// first genuine error immediately (else nil once all have exited),
-		// keeping the single watchErr channel main selects on.
-		results := make(chan error, len(watchers))
-		for _, w := range watchers {
-			go func(w *ecs.Watcher) { results <- w.Run(ctx) }(w)
-		}
-		go func() {
-			reported := false
-			for range watchers {
-				if err := <-results; err != nil && !errors.Is(err, context.Canceled) && !reported {
-					watchErr <- err
-					reported = true
-				}
-			}
-			if !reported {
-				watchErr <- nil
-			}
-		}()
+		runAll(ctx, watchers, watchErr)
 		return nil
 
+	case "lambda":
+		return startLambda(ctx, registrar, readers, logger, watchErr)
+
 	default:
-		return fmt.Errorf("unknown TSSERVE_DISCOVERY=%q; expected 'docker' or 'ecs'", mode)
+		return fmt.Errorf("unknown TSSERVE_DISCOVERY=%q; expected 'docker', 'ecs' or 'lambda'", mode)
+	}
+}
+
+// runAll runs every watcher concurrently. Each watcher's Run only returns on
+// ctx cancellation, so a fan-in coordinator forwards the first genuine error
+// immediately (else nil once all have exited), keeping the single watchErr
+// channel main selects on.
+func runAll[W interface{ Run(context.Context) error }](ctx context.Context, watchers []W, watchErr chan<- error) {
+	results := make(chan error, len(watchers))
+	for _, w := range watchers {
+		go func() { results <- w.Run(ctx) }()
+	}
+	go func() {
+		reported := false
+		for range watchers {
+			if err := <-results; err != nil && !errors.Is(err, context.Canceled) && !reported {
+				watchErr <- err
+				reported = true
+			}
+		}
+		if !reported {
+			watchErr <- nil
+		}
+	}()
+}
+
+// startLambda plans and starts the Lambda readers, one per configured account
+// (or one from the shared defaults), with the resilience contract of the ECS
+// readers.
+func startLambda(ctx context.Context, registrar *registrarAdapter, readers *ecs.Registry, logger *slog.Logger, watchErr chan<- error) error {
+	interval, err := parseInterval("TSSERVE_LAMBDA_POLL_INTERVAL")
+	if err != nil {
+		return err
+	}
+	retryInterval, err := parseInterval("TSSERVE_LAMBDA_RETRY_INTERVAL")
+	if err != nil {
+		return err
+	}
+	accounts, err := lambda.ParseAccounts(os.Getenv("TSSERVE_LAMBDA_ACCOUNTS"))
+	if err != nil {
+		return err
+	}
+	specs, err := lambda.Plan(accounts, lambda.Defaults{
+		Region:       os.Getenv("AWS_REGION"),
+		Profile:      os.Getenv("TSSERVE_LAMBDA_AWS_PROFILE"),
+		ConfigFile:   os.Getenv("TSSERVE_LAMBDA_AWS_CONFIG_FILE"),
+		PollInterval: interval,
+	})
+	if err != nil {
+		return err
+	}
+
+	watchers := buildLambdaWatchers(ctx, specs, len(accounts) > 0, retryInterval, registrar, readers, logger)
+	if len(watchers) == 0 {
+		// As for ECS: don't crash-loop and don't send on watchErr; the
+		// readers table shows why.
+		logger.Error("lambda discovery: no readers could be initialised; " +
+			"the daemon will run but discover nothing until the configuration is fixed")
+		return nil
+	}
+	logger.Info("lambda discovery configured", "readers", len(watchers), "configured", len(specs))
+	runAll(ctx, watchers, watchErr)
+	return nil
+}
+
+// buildLambdaWatchers turns resolved specs into ready-to-run Lambda watchers,
+// with the resilience contract of buildECSWatchers: an AWS config that will not
+// load disables that reader; an unresolvable identity leaves it running,
+// unhealthy, and resolving lazily; a duplicate identity is logged and kept.
+func buildLambdaWatchers(
+	ctx context.Context,
+	specs []lambda.WatcherSpec,
+	deriveNames bool,
+	retryInterval time.Duration,
+	base *registrarAdapter,
+	readers *ecs.Registry,
+	logger *slog.Logger,
+) []*lambda.Watcher {
+	watchers := make([]*lambda.Watcher, 0, len(specs))
+	claim := newIdentityClaims()
+
+	for i, spec := range specs {
+		display := spec.Name
+		if display == "" {
+			if deriveNames {
+				display = fmt.Sprintf("accounts[%d]", i)
+			} else {
+				display = "default"
+			}
+		}
+		reader := readers.Add(ecs.ReaderStatus{
+			Name:         display,
+			Region:       spec.Region,
+			PollInterval: cmp.Or(spec.PollInterval, lambda.DefaultPollInterval),
+		})
+
+		awsCfg, err := awsConfigForSpec(ctx, awsContext{
+			Region:          spec.Region,
+			Profile:         spec.Profile,
+			ConfigFile:      spec.ConfigFile,
+			AccessKeyID:     spec.AccessKeyID,
+			SecretAccessKey: spec.SecretAccessKey,
+		})
+		if err != nil {
+			reader.NoteError(err)
+			logger.Error("lambda reader disabled: aws config failed", "reader", display, "region", spec.Region, "err", err)
+			continue
+		}
+
+		// origin is only read and written on this reader's watcher goroutine.
+		reg := *base
+		reg.origin = proxy.Origin{Account: display, Region: spec.Region}
+		reg.invoke = proxy.NewLambdaClient(awsCfg)
+
+		cfg := lambda.Config{
+			PollInterval:  spec.PollInterval,
+			RetryInterval: retryInterval,
+			Account:       display,
+			Region:        spec.Region,
+			Reader:        reader,
+		}
+
+		if spec.Name == "" && deriveNames {
+			resolve := stsAccountResolver(awsCfg)
+			onResolved := func(account string) {
+				if !claim(account) {
+					logger.Warn("lambda reader identity is a duplicate; give entries for one account "+
+						"in different regions distinct names",
+						"reader", display, "identity", account)
+				}
+				reg.origin.Account = account
+				// Takes effect only on the eager path, before NewWatcher copies
+				// cfg; lazily, the watcher updates its own copy's label.
+				cfg.Account = account
+				reader.SetAccount(account)
+			}
+			if account, err := resolve(ctx); err != nil {
+				reader.NoteError(fmt.Errorf("resolve account identity: %w", err))
+				logger.Warn("lambda reader identity unresolved (role not assumable yet?); will keep retrying",
+					"reader", display, "region", spec.Region, "retry_interval", retryInterval, "err", err)
+				cfg.ResolveAccount = resolve
+				cfg.OnAccountResolved = onResolved
+			} else {
+				onResolved(account)
+			}
+		} else if spec.Name != "" {
+			claim(spec.Name)
+		}
+
+		logger.Info("lambda reader ready", "reader", display, "region", spec.Region)
+		watchers = append(watchers, lambda.NewWatcher(cfg, awstagging.NewFromConfig(awsCfg), &reg, logger))
+	}
+	return watchers
+}
+
+// newIdentityClaims returns a function recording reader identities (explicit
+// names or resolved account IDs) that reports false for one already claimed.
+// It is safe for concurrent use: lazily resolved identities are claimed on
+// watcher goroutines.
+func newIdentityClaims() func(id string) bool {
+	var mu sync.Mutex
+	identities := map[string]struct{}{}
+	return func(id string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if _, dup := identities[id]; dup {
+			return false
+		}
+		identities[id] = struct{}{}
+		return true
+	}
+}
+
+// stsAccountResolver returns a resolver of the AWS account ID awsCfg's
+// credentials belong to.
+func stsAccountResolver(awsCfg awsconfig.Config) func(context.Context) (string, error) {
+	stsClient := awssts.NewFromConfig(awsCfg)
+	return func(ctx context.Context) (string, error) {
+		out, err := stsClient.GetCallerIdentity(ctx, &awssts.GetCallerIdentityInput{})
+		if err != nil {
+			return "", err
+		}
+		account := awsconfig.ToString(out.Account)
+		if account == "" {
+			return "", errors.New("STS returned an empty account id")
+		}
+		return account, nil
 	}
 }
 
@@ -422,20 +616,10 @@ func buildECSWatchers(
 ) ([]*ecs.Watcher, error) {
 	watchers := make([]*ecs.Watcher, 0, len(specs))
 
-	// identities dedupes resolved account IDs across readers (including those
+	// claim dedupes resolved account IDs across readers (including those
 	// resolved lazily, on watcher goroutines) so two readers pointing at the
 	// same account do not silently double-register.
-	var idMu sync.Mutex
-	identities := make(map[string]struct{}, len(specs))
-	claim := func(id string) bool {
-		idMu.Lock()
-		defer idMu.Unlock()
-		if _, dup := identities[id]; dup {
-			return false
-		}
-		identities[id] = struct{}{}
-		return true
-	}
+	claim := newIdentityClaims()
 
 	for i, spec := range specs {
 		// A stable display identity for the readers table, even before (or
@@ -455,7 +639,13 @@ func buildECSWatchers(
 			PollInterval: pollIntervalOrDefault(spec.PollInterval),
 		})
 
-		awsCfg, err := awsConfigForSpec(ctx, spec)
+		awsCfg, err := awsConfigForSpec(ctx, awsContext{
+			Region:          spec.Region,
+			Profile:         spec.Profile,
+			ConfigFile:      spec.ConfigFile,
+			AccessKeyID:     spec.AccessKeyID,
+			SecretAccessKey: spec.SecretAccessKey,
+		})
 		if err != nil {
 			reader.NoteError(err)
 			logger.Error("ecs reader disabled: aws config failed",
@@ -483,18 +673,7 @@ func buildECSWatchers(
 		// failure, hand the watcher a resolver so it keeps retrying rather than
 		// giving up. An explicit name skips STS entirely.
 		if spec.Name == "" && deriveNames {
-			stsClient := awssts.NewFromConfig(awsCfg)
-			resolve := func(ctx context.Context) (string, error) {
-				out, err := stsClient.GetCallerIdentity(ctx, &awssts.GetCallerIdentityInput{})
-				if err != nil {
-					return "", err
-				}
-				account := awsconfig.ToString(out.Account)
-				if account == "" {
-					return "", errors.New("STS returned an empty account id")
-				}
-				return account, nil
-			}
+			resolve := stsAccountResolver(awsCfg)
 			onResolved := func(account string) {
 				if !claim(account) {
 					logger.Warn("ecs reader identity is a duplicate; its services may be ignored",
@@ -552,14 +731,24 @@ func pollIntervalOrDefault(d time.Duration) time.Duration {
 	return d
 }
 
-// awsConfigForSpec loads the AWS SDK config for one account's credential
+// awsContext is one reader's AWS credential context, whichever discovery mode
+// the reader belongs to.
+type awsContext struct {
+	Region          string
+	Profile         string
+	ConfigFile      string
+	AccessKeyID     string
+	SecretAccessKey string
+}
+
+// awsConfigForSpec loads the AWS SDK config for one reader's credential
 // context. It is deliberately scoped to tsserve's own settings (region,
 // profile, config file, or static credentials) rather than the process-wide
 // AWS_PROFILE / AWS_CONFIG_FILE, so tsnet's WIF flow — which calls
 // LoadDefaultConfig itself and must resolve to the EC2 instance role identity
 // Tailscale trusts — is never pulled onto a cross-account role assumed for ECS
-// reads.
-func awsConfigForSpec(ctx context.Context, spec ecs.WatcherSpec) (awsconfig.Config, error) {
+// or Lambda reads.
+func awsConfigForSpec(ctx context.Context, spec awsContext) (awsconfig.Config, error) {
 	opts := []func(*awsconfigload.LoadOptions) error{
 		awsconfigload.WithRetryMode(awsconfig.RetryModeAdaptive),
 		awsconfigload.WithRetryMaxAttempts(5),
@@ -585,32 +774,19 @@ func awsConfigForSpec(ctx context.Context, spec ecs.WatcherSpec) (awsconfig.Conf
 	return cfg, nil
 }
 
-func parsePollInterval(s string) (time.Duration, error) {
-	if s == "" {
-		return 0, nil // 0 lets ecs.NewWatcher pick the default
-	}
-	d, err := time.ParseDuration(s)
-	if err != nil {
-		return 0, fmt.Errorf("TSSERVE_ECS_POLL_INTERVAL=%q: %w", s, err)
-	}
-	if d <= 0 {
-		return 0, fmt.Errorf("TSSERVE_ECS_POLL_INTERVAL must be positive, got %s", s)
-	}
-	return d, nil
-}
-
-// parseRetryInterval reads the slow cadence used to retry unhealthy readers. An
-// empty value yields 0, letting ecs.NewWatcher apply its 2-minute default.
-func parseRetryInterval(s string) (time.Duration, error) {
+// parseInterval reads a positive duration from the env var name. An empty
+// value yields 0, letting the watcher apply its default.
+func parseInterval(name string) (time.Duration, error) {
+	s := os.Getenv(name)
 	if s == "" {
 		return 0, nil
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil {
-		return 0, fmt.Errorf("TSSERVE_ECS_RETRY_INTERVAL=%q: %w", s, err)
+		return 0, fmt.Errorf("%s=%q: %w", name, s, err)
 	}
 	if d <= 0 {
-		return 0, fmt.Errorf("TSSERVE_ECS_RETRY_INTERVAL must be positive, got %s", s)
+		return 0, fmt.Errorf("%s must be positive, got %s", name, s)
 	}
 	return d, nil
 }

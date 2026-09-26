@@ -52,11 +52,8 @@ func Parse(labels map[string]string) (*ServiceDef, error) {
 	}
 
 	svc := labels[Service]
-	if svc == "" {
-		return nil, fmt.Errorf("missing required label %s", Service)
-	}
-	if !strings.HasPrefix(svc, "svc:") {
-		return nil, fmt.Errorf("label %s=%q must start with %q", Service, svc, "svc:")
+	if err := ValidateService(svc); err != nil {
+		return nil, err
 	}
 
 	portStr := labels[Port]
@@ -81,21 +78,36 @@ func Parse(labels map[string]string) (*ServiceDef, error) {
 		return nil, fmt.Errorf("label %s=%q must be 'http' or 'https'", Scheme, scheme)
 	}
 
-	var caps []string
-	if raw := labels[Caps]; raw != "" {
-		for c := range strings.SplitSeq(raw, ",") {
-			c = strings.TrimSpace(c)
-			if c != "" {
-				caps = append(caps, c)
-			}
-		}
-	}
-
 	return &ServiceDef{
 		Service: svc,
 		Port:    uint16(port),
 		Network: network,
 		Scheme:  scheme,
-		Caps:    caps,
+		Caps:    ParseCaps(labels[Caps]),
 	}, nil
+}
+
+// ValidateService checks a tsserve.service value: it is required and must
+// name a Tailscale Service ("svc:" prefix). Shared with discovery sources
+// whose vocabulary has no port, which therefore cannot use [Parse].
+func ValidateService(svc string) error {
+	if svc == "" {
+		return fmt.Errorf("missing required label %s", Service)
+	}
+	if !strings.HasPrefix(svc, "svc:") {
+		return fmt.Errorf("label %s=%q must start with %q", Service, svc, "svc:")
+	}
+	return nil
+}
+
+// ParseCaps splits a tsserve.caps value into its capability names, trimming
+// whitespace and dropping empty entries. An empty value yields nil.
+func ParseCaps(raw string) []string {
+	var caps []string
+	for c := range strings.SplitSeq(raw, ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			caps = append(caps, c)
+		}
+	}
+	return caps
 }
