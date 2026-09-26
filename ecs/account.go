@@ -87,7 +87,7 @@ func Plan(accounts []Account, d Defaults) ([]WatcherSpec, error) {
 			PollInterval: d.PollInterval,
 		}
 		if spec.Cluster == "" {
-			return nil, fmt.Errorf("TSSERVE_ECS_CLUSTER is required when TSSERVE_DISCOVERY=ecs")
+			return nil, fmt.Errorf("TSSERVE_ECS_CLUSTER is required when TSSERVE_DISCOVERY includes ecs")
 		}
 		return []WatcherSpec{spec}, nil
 	}

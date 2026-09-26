@@ -145,10 +145,13 @@ func run() error {
 	defer mgr.Close()
 
 	// readers tracks per-reader ECS and Lambda discovery status for the status
-	// page. It stays empty in Docker mode.
+	// page. It stays empty when only docker discovery is configured.
 	readers := ecs.NewRegistry()
 
-	discoveryMode := strings.ToLower(envDefault("TSSERVE_DISCOVERY", "docker"))
+	modes, err := parseDiscoveryModes(envDefault("TSSERVE_DISCOVERY", "docker"))
+	if err != nil {
+		return err
+	}
 
 	traefikPort, err := local.ParseTraefikPort(os.Getenv("TSSERVE_TRAEFIK_PORT"))
 	if err != nil {
@@ -163,7 +166,7 @@ func run() error {
 		Metrics:       mc,
 		TraefikPort:   traefikPort,
 		MetricsAddr:   metricsAddr,
-		DiscoveryMode: discoveryMode,
+		DiscoveryMode: strings.Join(modes, ", "),
 		TSNet:         srv,
 		Started:       time.Now(),
 		Readers:       readerSource{readers},
@@ -174,8 +177,10 @@ func run() error {
 	fatal := make(chan error, 1)
 	registrar := &registrarAdapter{mgr: mgr, fatal: fatal}
 
-	watchErr := make(chan error, 1)
-	if err := startWatcher(ctx, discoveryMode, registrar, readers, logger, watchErr); err != nil {
+	watchErr, err := startModes(ctx, modes, func(mode string, modeErr chan<- error) error {
+		return startWatcher(ctx, mode, registrar, readers, logger, modeErr)
+	})
+	if err != nil {
 		return err
 	}
 
@@ -327,8 +332,8 @@ func (a *registrarAdapter) forwardFatal(err error) {
 
 func (a *registrarAdapter) Deregister(containerID string) { a.mgr.Deregister(containerID) }
 
-// startWatcher selects and starts the configured discovery backend, sending
-// its terminal error (or nil on clean shutdown) on watchErr.
+// startWatcher starts one discovery mode, sending its terminal error (or nil
+// on clean shutdown) on watchErr.
 func startWatcher(ctx context.Context, mode string, registrar *registrarAdapter, readers *ecs.Registry, logger *slog.Logger, watchErr chan<- error) error {
 	switch mode {
 	case "docker":
@@ -401,7 +406,63 @@ func startWatcher(ctx context.Context, mode string, registrar *registrarAdapter,
 		return startLambda(ctx, registrar, readers, logger, watchErr)
 
 	default:
-		return fmt.Errorf("unknown TSSERVE_DISCOVERY=%q; expected 'docker', 'ecs' or 'lambda'", mode)
+		return fmt.Errorf("unknown discovery mode %q; expected 'docker', 'ecs' or 'lambda'", mode)
+	}
+}
+
+// parseDiscoveryModes parses TSSERVE_DISCOVERY: a comma-separated list of
+// discovery modes, matched case-insensitively with surrounding whitespace
+// ignored. An unknown, empty or repeated entry is an error naming the
+// offending value.
+func parseDiscoveryModes(raw string) ([]string, error) {
+	var modes []string
+	seen := make(map[string]bool)
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		mode := strings.ToLower(entry)
+		switch {
+		case mode == "":
+			return nil, fmt.Errorf("TSSERVE_DISCOVERY=%q has an empty entry", raw)
+		case mode != "docker" && mode != "ecs" && mode != "lambda":
+			return nil, fmt.Errorf("unknown discovery mode %q in TSSERVE_DISCOVERY=%q; expected 'docker', 'ecs' or 'lambda'", entry, raw)
+		case seen[mode]:
+			return nil, fmt.Errorf("discovery mode %q is repeated in TSSERVE_DISCOVERY=%q", entry, raw)
+		}
+		seen[mode] = true
+		modes = append(modes, mode)
+	}
+	return modes, nil
+}
+
+// startModes starts each discovery mode with its own report channel and fans
+// them in with runAll, so the returned channel carries the first genuine
+// error at once, and nil only when every mode has finished.
+func startModes(ctx context.Context, modes []string, start func(mode string, modeErr chan<- error) error) (<-chan error, error) {
+	results := make([]modeResult, len(modes))
+	for i, mode := range modes {
+		ch := make(chan error, 1)
+		results[i] = ch
+		if err := start(mode, ch); err != nil {
+			return nil, err
+		}
+	}
+	watchErr := make(chan error, 1)
+	runAll(ctx, results, watchErr)
+	return watchErr, nil
+}
+
+// modeResult is one discovery mode's report channel, adapted so runAll can
+// fan in modes exactly as it fans in readers. A mode that never reports (one
+// that started no readers) holds its Run until shutdown, so no nil is
+// forwarded while the process runs.
+type modeResult <-chan error
+
+func (m modeResult) Run(ctx context.Context) error {
+	select {
+	case err := <-m:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
