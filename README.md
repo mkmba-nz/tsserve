@@ -1,11 +1,25 @@
 # tsserve
 
-A single-binary Docker → Tailscale Services proxy built on `tsnet`.
+A single-binary proxy from Docker containers, ECS tasks and Lambda functions
+to Tailscale Services, built on `tsnet`.
 
-`tsserve` watches Docker for containers labelled with `tsserve.*`, registers
-them as Tailscale Services using `tsnet.Server.ListenService`, and reverse
-proxies HTTPS traffic to them. All services share one tailnet node, so the
+`tsserve` discovers backends — containers labelled with `tsserve.*`, or
+Lambda functions carrying `tsserve.*` tags — registers them as Tailscale
+Services using `tsnet.Server.ListenService`, and reverse proxies HTTPS
+traffic to them. All services share one tailnet node, so the
 device list stays clean.
+
+Discovery modes, chosen with `TSSERVE_DISCOVERY` (one or a comma-separated
+list, e.g. `ecs,lambda`; default `docker`):
+
+- `docker` — labelled containers on the local Docker socket.
+- `ecs` — labelled containers of ECS tasks, read from the AWS ECS API, for
+  clusters where Tailscale must not run on the container hosts.
+- `lambda` — AWS Lambda functions tagged with `tsserve.*` tags. Each request
+  is delivered to the function with one Lambda `Invoke` call; no function URL
+  or other public endpoint is needed. See
+  [SPEC.md → Lambda Function Backends](./SPEC.md#lambda-function-backends)
+  for the event format, IAM, networking and limits.
 
 See [SPEC.md](./SPEC.md) for the full design.
 
@@ -46,6 +60,13 @@ defined in the Tailscale admin console.
 | `tsserve.scheme` | no | `http` | `http` or `https` for the backend. |
 | `tsserve.caps` | no | — | Comma-separated app capability names. |
 
+Lambda functions are configured with the same keys as AWS tags on the
+function: `tsserve.enable=true` and `tsserve.service` are required,
+`tsserve.caps` is optional, and `tsserve.qualifier` optionally names the
+version or alias to invoke (default `$LATEST`). `tsserve.port`,
+`tsserve.network` and `tsserve.scheme` are ignored on a function. A service's
+backends are either all containers or all functions.
+
 On every request tsserve resolves the connecting peer (in-process `whois`) and
 injects node identity headers so the backend can tell devices apart:
 
@@ -77,6 +98,21 @@ General:
   `TSSERVE_CERT_S3_BUCKET` for durable identity + certs on ephemeral hosts.
 - `TSSERVE_LOG_LEVEL` (`debug` | `info` | `warn` | `error`)
 
+Discovery:
+
+- `TSSERVE_DISCOVERY` (default `docker`) — one or more of `docker`, `ecs`,
+  `lambda`, comma-separated. Each mode's variables are read only when it is
+  listed.
+- `AWS_REGION` — region for the ECS and Lambda readers.
+- `TSSERVE_ECS_CLUSTER`, `TSSERVE_ECS_ACCOUNTS`, `TSSERVE_ECS_POLL_INTERVAL`
+  (default `10s`), `TSSERVE_ECS_RETRY_INTERVAL` (default `2m`),
+  `TSSERVE_ECS_AWS_PROFILE`, `TSSERVE_ECS_AWS_CONFIG_FILE` — ECS discovery.
+  See [SPEC.md → ECS Cluster Mode](./SPEC.md#ecs-cluster-mode).
+- `TSSERVE_LAMBDA_ACCOUNTS`, `TSSERVE_LAMBDA_POLL_INTERVAL` (default `30s`),
+  `TSSERVE_LAMBDA_RETRY_INTERVAL` (default `2m`), `TSSERVE_LAMBDA_AWS_PROFILE`,
+  `TSSERVE_LAMBDA_AWS_CONFIG_FILE` — Lambda discovery, one reader per account
+  and region. Requires `tag:GetResources` and `lambda:InvokeFunction`.
+
 Certificate cache (optional; for ephemeral filesystems like ECS/Fargate):
 
 - `TSSERVE_CERT_S3_BUCKET` — back tsnet's TLS cert cache with S3. Certs are
@@ -102,7 +138,8 @@ Observability:
 In addition to the per-service Tailscale listeners, tsserve always runs:
 
 - `https://<TSSERVE_HOSTNAME>.<tailnet>.ts.net/` — status page (tailnet
-  identity, discovery mode, registered backends, build info).
+  identity, discovery modes, registered backends, ECS and Lambda readers,
+  build info).
 - `https://<TSSERVE_HOSTNAME>.<tailnet>.ts.net/traefik/...` — reverse proxy
   to `http://localhost:<TSSERVE_TRAEFIK_PORT>` when configured.
 - `http://<TSSERVE_METRICS_ADDR>/metrics` — Prometheus exposition, default
