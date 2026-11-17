@@ -188,6 +188,38 @@ func TestReverseProxy_DoesNotAddLoopbackXForwardedFor(t *testing.T) {
 	}
 }
 
+// A client-sent Forwarded, X-Real-Ip or Client-Ip never reaches the backend, and
+// X-Forwarded-For is reduced to the single tailnet address.
+func TestReverseProxy_StripsSpoofedAddressHeaders(t *testing.T) {
+	var got http.Header
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+	}))
+	defer backend.Close()
+
+	host, port := hostPort(t, backend.URL)
+	rp := newSingleBackendProxy("http", host, port, discardLogger(), nil, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Forwarded-For", "100.64.0.42, 1.2.3.4")
+	req.Header.Set("Forwarded", "for=1.2.3.4")
+	req.Header.Set("X-Real-Ip", "1.2.3.4")
+	req.Header.Set("Client-Ip", "1.2.3.4")
+	rp.ServeHTTP(httptest.NewRecorder(), req)
+
+	if v := got.Values("X-Forwarded-For"); len(v) != 1 || v[0] != "100.64.0.42" {
+		t.Errorf("X-Forwarded-For at backend = %q, want exactly [100.64.0.42]", v)
+	}
+	for _, h := range []string{"Forwarded", "X-Real-Ip", "Client-Ip"} {
+		if v := got.Values(h); len(v) != 0 {
+			t.Errorf("%s at backend = %q, want absent", h, v)
+		}
+	}
+	if got.Get("X-Forwarded-Proto") != "https" {
+		t.Errorf("X-Forwarded-Proto = %q, want https", got.Get("X-Forwarded-Proto"))
+	}
+}
+
 func TestReverseProxy_ConnectionRefused_502AndErrorClassified(t *testing.T) {
 	// Bind to a port, immediately release it: subsequent connects refuse.
 	l, err := net.Listen("tcp", "127.0.0.1:0")
