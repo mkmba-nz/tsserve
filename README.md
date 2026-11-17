@@ -75,7 +75,9 @@ injects node identity headers so the backend can tell devices apart:
 - `Tailscale-Node-Tags` — the node's ACL tags, comma-separated, `tag:` prefix
   stripped (e.g. `github-runner,prod`), for tagged nodes only.
  Both headers are stripped from inbound
-requests before forwarding, so clients cannot spoof them.
+requests before forwarding, so clients cannot spoof them. Likewise `X-Forwarded-For`
+is the client's tailnet address only, and `Forwarded`, `X-Real-Ip` and `Client-Ip`
+are always stripped.
 
 ## Environment variables
 

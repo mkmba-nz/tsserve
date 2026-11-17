@@ -24,6 +24,11 @@ const (
 	headerNodeName = "Tailscale-Node-Name"
 )
 
+// addressHeaders are the request headers that carry a client address. They are
+// removed from every outbound request so a client cannot spoof its address;
+// X-Forwarded-For is then set again from the serve layer's value alone.
+var addressHeaders = []string{"Forwarded", "X-Forwarded-For", "X-Real-Ip", "Client-Ip"}
+
 // whoisFunc resolves the owner of a tailnet address. It matches
 // (*local.Client).WhoIs so the production path passes that method directly and
 // tests can inject a stub.
@@ -91,14 +96,17 @@ func newReverseProxy(scheme string, pool *backendPool, logger *slog.Logger, onEr
 			pr.Out.URL.Scheme = scheme
 			// Tailscale's serve layer fronts our listener and sets
 			// X-Forwarded-For to the peer's tailnet IP before forwarding to us
-			// over a loopback socket. httputil.ReverseProxy in Rewrite mode
-			// strips client-provided forwarding headers from pr.Out, so we
-			// explicitly copy the upstream header from pr.In. We deliberately do
-			// not call pr.SetXForwarded(): it would otherwise insert our local
-			// RemoteAddr (127.0.0.1) into X-Forwarded-For, which is useless to
-			// the backend.
-			if xff := pr.In.Header.Get("X-Forwarded-For"); xff != "" {
-				pr.Out.Header.Set("X-Forwarded-For", xff)
+			// over a loopback socket. Every address-carrying header is deleted
+			// from pr.Out explicitly (not left to httputil's Rewrite semantics),
+			// then X-Forwarded-For is set to the leftmost entry of the serve
+			// layer's value. We deliberately do not call pr.SetXForwarded(): it
+			// would insert our local RemoteAddr (127.0.0.1) into
+			// X-Forwarded-For, which is useless to the backend.
+			for _, h := range addressHeaders {
+				pr.Out.Header.Del(h)
+			}
+			if ip := firstForwardedFor(pr.In.Header.Get("X-Forwarded-For")); ip != "" {
+				pr.Out.Header.Set("X-Forwarded-For", ip)
 			}
 			pr.Out.Header.Set("X-Forwarded-Host", pr.In.Host)
 			pr.Out.Header.Set("X-Forwarded-Proto", "https")

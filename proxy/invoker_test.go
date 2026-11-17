@@ -229,6 +229,33 @@ func TestFunctionInvoker_NodeNameForUntaggedPeer(t *testing.T) {
 	}
 }
 
+// Client-sent address headers never reach the function: its event carries the
+// tailnet address in x-forwarded-for and sourceIp, and no other address header.
+func TestFunctionInvoker_StripsSpoofedAddressHeaders(t *testing.T) {
+	fake := returning(`{}`)
+	rp := functionProxy(&reasonRecorder{}, nil, fake)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Forwarded-For", "100.64.0.9, 1.2.3.4")
+	req.Header.Set("Forwarded", "for=1.2.3.4")
+	req.Header.Set("X-Real-Ip", "1.2.3.4")
+	req.Header.Set("Client-Ip", "1.2.3.4")
+	rp.ServeHTTP(httptest.NewRecorder(), req)
+
+	ev := fake.event(t, 0)
+	if ev.Headers["x-forwarded-for"] != "100.64.0.9" {
+		t.Errorf("x-forwarded-for = %q, want 100.64.0.9", ev.Headers["x-forwarded-for"])
+	}
+	if ev.RequestContext.HTTP.SourceIP != "100.64.0.9" {
+		t.Errorf("sourceIp = %q, want 100.64.0.9", ev.RequestContext.HTTP.SourceIP)
+	}
+	for _, k := range []string{"forwarded", "x-real-ip", "client-ip"} {
+		if v, ok := ev.Headers[k]; ok {
+			t.Errorf("headers[%q] = %q, want absent", k, v)
+		}
+	}
+}
+
 func TestFunctionInvoker_RequestBodyEncoding(t *testing.T) {
 	binary := []byte{0x00, 0xff, 0x10, 0x80}
 	for _, tc := range []struct {
